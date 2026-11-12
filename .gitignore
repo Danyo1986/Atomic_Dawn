@@ -1,0 +1,4 @@
+assets/raw/
+dist/
+node_modules/
+*.blend1

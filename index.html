@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atomic Dawn</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }
+</script>
+</head>
+<body>
+<div id="view">
+  <canvas id="overlay"></canvas>
+  <div id="msgs"></div>
+  <div id="topbar">
+    <button id="btnMenu" title="Menü (Esc)">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+    <div id="clock">00:00</div>
+    <div id="modeHint"></div>
+  </div>
+  <div id="tip"></div>
+</div>
+
+<aside id="side">
+  <div class="brand"><span>ATOMIC</span> DAWN</div>
+  <div id="radar">
+    <canvas id="mini" width="256" height="256"></canvas>
+    <div id="radarOff"><div class="scan"></div><span>RADAR OFFLINE</span><small>Radarstation erforderlich</small></div>
+  </div>
+  <div class="res">
+    <div id="credits">$ 0</div>
+    <div id="power" title="Energie: Erzeugung / Verbrauch">
+      <div id="powBar"><div id="powUse"></div></div>
+      <span id="powTxt">0 / 0</span>
+    </div>
+  </div>
+  <div class="tools">
+    <button id="btnRepair" title="Reparieren (R)"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.2L3 17.8V21h3.2l6.3-6.3a4 4 0 0 0 5.2-5.4l-2.6 2.6-2.4-.6-.6-2.4z" fill="currentColor"/></svg>Reparieren</button>
+    <button id="btnSell" title="Verkaufen (V)"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2v20M17 6.5c0-1.9-2.2-3-5-3s-5 1.1-5 3.2c0 4.6 10 2.4 10 7.3 0 2.1-2.2 3.5-5 3.5s-5-1.3-5-3.3" stroke="currentColor" stroke-width="2" fill="none"/></svg>Verkaufen</button>
+  </div>
+  <button id="btnNuke" title="Atomrakete (N)"><i></i><span id="nukeTxt">☢ Atomrakete</span></button>
+  <div id="tabs"></div>
+  <div id="grid"></div>
+  <div id="info"></div>
+</aside>
+
+<div id="loading" class="screen">
+  <div class="logo"><span>ATOMIC</span> DAWN</div>
+  <div class="sub">Modernes Echtzeit-Strategiespiel</div>
+  <div class="bar"><div id="loadFill"></div></div>
+  <div id="loadTxt">Lade Modelle und Texturen …</div>
+</div>
+
+<div id="menu" class="screen hidden">
+  <img class="poster" src="assets/title.webp" alt="Atomic Dawn">
+  <div class="panel">
+    <div class="logo"><span>ATOMIC</span> DAWN</div>
+    <div class="sub">Gefecht – 1 Spieler gegen Computergegner</div>
+    <div class="form">
+      <label>Partei<select id="optFaction"><option value="allies" selected>Allianz (blau)</option><option value="axis">Achsenmacht (rot)</option></select></label>
+      <label>Gegner<select id="optEnemies"><option value="1">1 Gegner</option><option value="2">2 Gegner</option><option value="3" selected>3 Gegner</option></select></label>
+      <label>Schwierigkeit<select id="optDiff"><option value="easy">Leicht</option><option value="normal" selected>Normal</option><option value="hard">Schwer</option></select></label>
+      <label>Startkapital<select id="optCredits"><option value="5000">5.000</option><option value="10000" selected>10.000</option><option value="20000">20.000</option></select></label>
+      <label>Karte<select id="optMap"><option value="1">Grenzland</option><option value="7">Seenplatte</option><option value="23">Hochebene</option><option value="42">Frostheim (Stadt im Schnee)</option><option value="0">Zufällig</option></select></label>
+      <label>Grafik<select id="optGfx"><option value="high">Hoch (AO, Bloom, Schatten 4K)</option><option value="mid" selected>Mittel</option><option value="low">Niedrig</option></select></label>
+      <label>Kriegsnebel<select id="optFog"><option value="1" selected>An</option><option value="0">Aus</option></select></label>
+      <div class="colorPick"><span>Farbe <b id="colorName"></b></span><div id="optColor"></div></div>
+    </div>
+    <button id="btnStart" class="primary">Gefecht starten</button>
+    <div class="credits-note">Modelle: Einheiten und Gebäude eigene Blender-Modelle · Gelände, Felsen, Requisiten &amp; HDRI: Poly Haven (CC0)</div>
+  </div>
+</div>
+
+<div id="pause" class="screen hidden">
+  <div class="panel">
+    <h2>Pause</h2>
+    <div class="help">
+      <div><b>Linksklick</b> auswählen · <b>Ziehen</b> Rahmenauswahl · <b>Doppelklick</b> alle gleichen Einheiten</div>
+      <div><b>Rechtsklick</b> bewegen / angreifen / Erz sammeln · mit Gebäude: Sammelpunkt</div>
+      <div><b>Pfeiltasten / Bildschirmrand</b> Kamera · <b>Mausrad</b> Zoom · <b>Q / E</b> drehen · <b>Mittlere Maustaste</b> ziehen</div>
+      <div><b>A</b> Angriffsbewegung · <b>S</b> Stopp · <b>D</b> Mobile Basis entfalten · <b>H</b> zur Basis</div>
+      <div><b>Strg+1–9</b> Gruppe festlegen · <b>1–9</b> Gruppe wählen · <b>R</b> Reparieren · <b>V</b> Verkaufen · <b>N</b> Atomrakete · <b>M</b> Ton</div>
+      <div><b>Seitenleiste:</b> Links = bauen (Shift: 5×), Rechts = abbrechen</div>
+    </div>
+    <label class="vol">Lautstärke <input id="optVol" type="range" min="0" max="1" step="0.05" value="0.7"></label>
+    <button id="btnResume" class="primary">Fortsetzen</button>
+    <button id="btnQuit">Hauptmenü</button>
+  </div>
+</div>
+
+<div id="end" class="screen hidden">
+  <div class="panel">
+    <h1 id="endTitle">Sieg</h1>
+    <table id="endStats"></table>
+    <button id="btnAgain" class="primary">Hauptmenü</button>
+  </div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
