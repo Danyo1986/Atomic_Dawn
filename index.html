@@ -6,6 +6,7 @@
 <title>Atomic Dawn</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="favicon.ico" type="image/x-icon">
 <link rel="stylesheet" href="css/style.css">
 <script type="importmap">
 { "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }
@@ -23,6 +24,8 @@
     <div id="modeHint"></div>
   </div>
   <div id="tip"></div>
+  <div id="netBadge"></div>
+  <input id="gameChat" type="text" maxlength="200" placeholder="Nachricht an alle (Enter senden, Esc abbrechen)">
 </div>
 
 <aside id="side">
@@ -49,16 +52,45 @@
 </aside>
 
 <div id="loading" class="screen">
+  <!-- Einsatz-Briefing: Inhalte, Radar-Punkte und Ladeschritte setzt js/menufx.js -->
+  <div class="ldGrid" aria-hidden="true"></div>
+  <div class="ldScan" aria-hidden="true"></div>
+  <div class="ldFrame" aria-hidden="true"></div>
   <div class="logo"><span>ATOMIC</span> DAWN</div>
   <div class="sub">Modernes Echtzeit-Strategiespiel</div>
-  <div class="bar"><div id="loadFill"></div></div>
+  <div class="brief">
+    <div class="radar" id="ldRadar" aria-hidden="true"><div class="sweep"></div><i class="home"></i></div>
+    <div class="briefBody">
+      <div class="bKick" id="ldOp">Systemstart</div>
+      <h2 id="ldMap">Gefechtssysteme</h2>
+      <div class="bDesc" id="ldDesc">Modelle, Gelände und Lagekarte werden vorbereitet</div>
+      <dl id="ldFacts"></dl>
+      <ol id="ldSteps"></ol>
+    </div>
+  </div>
+  <div class="ldBar"><div class="bar"><div id="loadFill"></div></div><b id="ldPct">0%</b></div>
   <div id="loadTxt">Lade Modelle und Texturen …</div>
+  <div class="tips" aria-hidden="true">
+    <span>Strg+1–9 legt Gruppen fest, 1–9 wählt sie</span>
+    <span>A + Klick: Angriffsbewegung</span>
+    <span>D entfaltet die Mobile Basis</span>
+    <span>N startet die Atomrakete, sobald sie geladen ist</span>
+    <span>Rechtsklick mit Gebäude: Sammelpunkt</span>
+    <span>Shift + Bauklick: fünf auf einmal</span>
+    <span>Leertaste springt zum letzten Angriff</span>
+    <span>Erzsammler bringen Geld – schütze sie</span>
+  </div>
+  <div class="ldTicker" aria-hidden="true"><span id="ldCoord"></span><span class="sec"><i></i>Verschlüsselte Verbindung</span></div>
 </div>
 
 <div id="menu" class="screen hidden">
-  <img class="poster" src="assets/title.webp" alt="Atomic Dawn">
+  <div class="menuFx"></div>
+  <div class="posterWrap"><img class="poster" src="assets/title.webp" alt="Atomic Dawn"></div>
+  <div class="liveTag"><i></i>Live-Gefecht · Allianz gegen Achsenmacht</div>
   <div class="panel">
     <div class="logo"><span>ATOMIC</span> DAWN</div>
+    <div class="modeTabs"><button id="tabSolo" class="on">Gefecht</button><button id="tabNet">Mehrspieler</button></div>
+    <div id="soloView">
     <div class="sub">Gefecht – 1 Spieler gegen Computergegner</div>
     <div class="form">
       <label>Partei<select id="optFaction"><option value="allies" selected>Allianz (blau)</option><option value="axis">Achsenmacht (rot)</option></select></label>
@@ -71,6 +103,37 @@
       <div class="colorPick"><span>Farbe <b id="colorName"></b></span><div id="optColor"></div></div>
     </div>
     <button id="btnStart" class="primary">Gefecht starten</button>
+    </div>
+    <!-- Mehrspieler: Verbindung → Raumliste → Lobby (js/lobby.js) -->
+    <div id="netView" class="hidden">
+      <div class="sub">Online – bis zu 4 Spieler, Teams und Computergegner</div>
+      <div id="netConnect" class="form">
+        <label class="wide">Server<input id="netServer" type="text" spellcheck="false" placeholder="wss://server.example.com"></label>
+        <label class="wide">Dein Name<input id="netName" type="text" maxlength="20" spellcheck="false"></label>
+        <button id="btnConnect" class="primary wide">Verbinden</button>
+      </div>
+      <div id="netRooms" class="hidden">
+        <div class="netHead"><span>Offene Spiele</span><button id="btnRefresh" class="small" title="Liste aktualisieren">⟳</button></div>
+        <div id="roomList" class="roomList"></div>
+        <div class="netRow"><input id="netCode" type="text" maxlength="6" placeholder="Raumcode" spellcheck="false"><button id="btnJoin">Beitreten</button></div>
+        <div class="netRow"><button id="btnCreate" class="primary">Neues Spiel erstellen</button><button id="btnDisconnect">Trennen</button></div>
+      </div>
+      <div id="netRoom" class="hidden">
+        <div class="netHead"><span id="roomTitle"></span><span class="code" title="Diesen Code an Mitspieler weitergeben">Code <b id="roomCode"></b></span></div>
+        <div class="form" id="roomSettings">
+          <label>Spielmodus<select id="rsMode"><option value="ffa">Jeder gegen jeden</option><option value="2v2">2 gegen 2</option><option value="2v1">2 gegen 1</option><option value="3v1">3 gegen 1</option><option value="free">Eigene Teams</option></select></label>
+          <label>Karte<select id="rsMap"><option value="1">Grenzland</option><option value="7">Seenplatte</option><option value="23">Hochebene</option><option value="42">Frostheim (Stadt im Schnee)</option><option value="0">Zufällig</option></select></label>
+          <label>Startkapital<select id="rsCredits"><option value="5000">5.000</option><option value="10000">10.000</option><option value="20000">20.000</option></select></label>
+          <label>Kriegsnebel<select id="rsFog"><option value="1">An</option><option value="0">Aus</option></select></label>
+          <label>Grafik<select id="netGfx"><option value="high">Hoch</option><option value="mid" selected>Mittel</option><option value="low">Niedrig</option></select></label>
+        </div>
+        <div id="slotList" class="slotList"></div>
+        <div id="chatLog" class="chatLog"></div>
+        <div class="netRow"><input id="chatIn" type="text" maxlength="200" placeholder="Nachricht an alle …"><button id="btnChat">Senden</button></div>
+        <div class="netRow"><button id="btnReady" class="primary">Bereit</button><button id="btnLeaveRoom">Verlassen</button></div>
+      </div>
+      <div id="netStatus" class="netStatus"></div>
+    </div>
     <div class="credits-note">Modelle: Einheiten und Gebäude eigene Blender-Modelle · Gelände, Felsen, Requisiten &amp; HDRI: Poly Haven (CC0)</div>
   </div>
 </div>
@@ -87,7 +150,9 @@
       <div><b>Seitenleiste:</b> Links = bauen (Shift: 5×), Rechts = abbrechen</div>
     </div>
     <label class="vol">Lautstärke <input id="optVol" type="range" min="0" max="1" step="0.05" value="0.7"></label>
+    <div id="netPauseInfo" class="netStatus"></div>
     <button id="btnResume" class="primary">Fortsetzen</button>
+    <button id="btnNetPause" class="hidden">Spiel für alle anhalten</button>
     <button id="btnQuit">Hauptmenü</button>
   </div>
 </div>

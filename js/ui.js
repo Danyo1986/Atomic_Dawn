@@ -79,20 +79,18 @@ export class UI {
   itemClick(e, it) {
     const game = this.game, p = game.human;
     e.preventDefault();
-    if (e.button === 2) { game.cancelItem(p, it.key); return; }
+    if (e.button === 2) { this.app.cmd({ op: 'cancel', type: it.key }); return; }
     if (e.button !== 0) return;
     const q = p.queues[it.d.key];
     if (it.d.wall) { if (game.canBuild(p, 'wall')) { this.app.input.startPlacement('wall'); play('click'); } else play('deny'); return; }
     if (it.kind === 'b') {
       if (q.ready && q.type === it.key) { this.app.input.startPlacement(it.key); play('click'); return; }
-      if (q.type === it.key) { q.paused = !q.paused; play('click'); return; }
+      if (q.type === it.key) { this.app.cmd({ op: 'hold', key: it.d.key }); play('click'); return; }
       if (q.type) { play('deny'); return; }
-      if (!game.queueItem(p, it.key)) play('deny');
+      if (!game.canBuild(p, it.key) || this.app.cmd({ op: 'queue', type: it.key, n: 1 }) === false) play('deny');
     } else {
-      const n = e.shiftKey ? 5 : 1;
-      let ok = false;
-      for (let i = 0; i < n; i++) ok = game.queueItem(p, it.key) || ok;
-      if (!ok) play('deny');
+      // Mehrspieler: Auftrag wirkt im nächsten Takt; vorab nur prüfen, ob der Bau überhaupt möglich ist
+      if (!game.canBuild(p, it.key) || this.app.cmd({ op: 'queue', type: it.key, n: e.shiftKey ? 5 : 1 }) === false) play('deny');
     }
   }
   bindTip() {
@@ -194,6 +192,16 @@ export class UI {
     }
   }
 
+  /** Chatzeile im Spiel (Mehrspieler): Name in Spielerfarbe, bleibt etwas länger stehen */
+  chat(from, text, css) {
+    const box = $('msgs'), d = document.createElement('div');
+    d.className = 'chat'; d.style.setProperty('--chat', css || '#fff');
+    const b = document.createElement('b'); b.textContent = from + ': '; b.style.color = css || '#fff';
+    d.append(b, document.createTextNode(text));
+    box.appendChild(d);
+    while (box.children.length > 6) box.firstChild.remove();
+    setTimeout(() => { d.style.opacity = 0; setTimeout(() => d.remove(), 700); }, 9000);
+  }
   message(text, warn = false, dedupe = null) {
     const box = $('msgs');
     if (dedupe) { const ex = box.querySelector(`[data-d="${dedupe}"]`); if (ex) ex.remove(); }
@@ -220,11 +228,11 @@ export class UI {
       if (e.def.cargo) extra = `<div class="dim">Ladung: ${Math.round(e.cargo)} / ${e.def.cargo}</div>`;
       else if (e.kind === 'unit' && e.def.weapon) extra = `<div class="dim" style="color:${e.rank === 2 ? '#ffd24a' : e.rank ? '#e8e8e8' : ''}">${['Rekrut', 'Veteran ›', 'Elite ››'][e.rank || 0]}</div>`;
       else if (e.kind === 'building' && e.def.power) extra = `<div class="dim">Energie: ${e.def.power > 0 ? '+' : ''}${e.def.power}</div>`;
-      if (e.type === 'helipad' && e.owner === 0) {
+      if (e.type === 'helipad' && game.mine(e)) {
         const seg = (n, cls) => Array.from({ length: AIRFIELD_SLOTS }, (_, i) => `<i class="${i < n ? cls : ''}"></i>`).join('');
         extra += `<div class="capRow"><span>Jagdbomber</span><div class="cap">${seg(game.padLoad(e, true), 'on')}</div></div><div class="capRow"><span>Hubschrauber</span><div class="cap">${seg(game.padLoad(e, false), 'heli')}</div></div>`;
       }
-      if (e.owner !== 0) extra += `<div class="dim" style="color:${TEAMS[e.owner].css}">${TEAMS[e.owner].name}</div>`;
+      if (!game.mine(e)) extra += `<div class="dim" style="color:${TEAMS[e.owner].css}">${game.playerName(game.players[e.owner])}${game.friendly(e) ? ' · verbündet' : ''}</div>`;
       box.innerHTML = `<img src="${A.thumbs[e.type] || ''}"><div><div class="t">${e.def.name}</div><div class="hp"><i style="width:${hp * 100}%;background:${hp > 0.5 ? '#57d98a' : hp > 0.25 ? '#f2c03a' : '#ff5a4a'}"></i></div><div class="dim">${Math.ceil(e.hp)} / ${e.maxHp}</div>${extra}</div>`;
     } else {
       const c = {};
@@ -242,7 +250,7 @@ export class UI {
     g.fillStyle = '#4aa8ff';
     for (const k of T.oreCells) if (T.ore[k] > 40) g.fillRect((k % MAPN) * CELL * sc, Math.floor(k / MAPN) * CELL * sc, CELL * sc + 0.5, CELL * sc + 0.5);
     for (const b of game.buildings) {
-      if (b.dead || (b.owner !== 0 && !b.seen && FOG.enabled)) continue;
+      if (b.dead || (!game.friendly(b) && !b.seen && FOG.enabled)) continue;
       g.fillStyle = TEAMS[b.owner].css;
       g.fillRect(b.cx * CELL * sc, b.cz * CELL * sc, b.w * CELL * sc, b.h * CELL * sc);
     }
@@ -305,22 +313,31 @@ export class UI {
       if (u.dead || !u.vis) continue;
       const sel = game.selection.has(u);
       const dmg = u.hp < u.maxHp;
-      if (!sel && hover !== u && !(dmg && u.owner === 0)) continue;
+      if (!sel && hover !== u && !(dmg && game.mine(u))) continue;
       const top = u.def.inf ? 3.4 : u.def.air ? 3.5 : 4.2;
       const p = proj(u.x, u.y + top, u.z); if (!p.ok) continue;
       const w = u.def.inf ? 22 : 40;
       bar(p.x, p.y, w, u.hp / u.maxHp, hpCol(u.hp / u.maxHp));
       if (u.def.cargo) { g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(p.x - w / 2 - 1, p.y + 6, w + 2, 4); g.fillStyle = '#ffc94a'; g.fillRect(p.x - w / 2, p.y + 7, w * u.cargo / u.def.cargo, 2); }
       if (u.rank) drawRank(g, p.x - w / 2 - 9, p.y + 2, u.rank);
-      if (u.group && sel) { g.fillStyle = '#fff'; g.font = '600 11px Inter'; g.fillText(u.group, p.x + w / 2 + 3, p.y + 5); }
     }
+    // Gruppennummer (Strg+1–9) über jeder eigenen Einheit einer Gruppe: kleines Schild
+    g.font = '700 10px Inter'; g.textAlign = 'center';
+    for (const u of game.units) {
+      if (u.dead || !u.group || !game.mine(u)) continue;
+      const p = proj(u.x, u.y + (u.def.inf ? 3.4 : u.def.air ? 3.5 : 4.2), u.z); if (!p.ok || p.x < 0 || p.x > W || p.y < 0 || p.y > H) continue;
+      const x = p.x + (u.def.inf ? 16 : 26), y = p.y - 2;
+      g.fillStyle = game.selection.has(u) ? 'rgba(109,255,138,.9)' : 'rgba(0,0,0,.7)'; g.fillRect(x - 6, y - 6, 12, 12);
+      g.fillStyle = game.selection.has(u) ? '#06140a' : '#fff'; g.fillText(u.group, x, y + 4);
+    }
+    g.textAlign = 'left';
     for (const u of game.units) { // Rangabzeichen auch ohne Lebensbalken
-      if (u.dead || !u.vis || !u.rank || game.selection.has(u) || hover === u || (u.hp < u.maxHp && u.owner === 0)) continue;
+      if (u.dead || !u.vis || !u.rank || game.selection.has(u) || hover === u || (u.hp < u.maxHp && game.mine(u))) continue;
       const p = proj(u.x, u.y + (u.def.inf ? 3.4 : u.def.air ? 3.5 : 4.2), u.z); if (!p.ok) continue;
       drawRank(g, p.x, p.y + 2, u.rank);
     }
     for (const b of game.buildings) { // Belegung der eigenen Flugfelder: Jagdbomber (blau), Hubschrauber (orange)
-      if (b.dead || b.owner !== 0 || b.type !== 'helipad' || b.rise < 1) continue;
+      if (b.dead || !game.mine(b) || b.type !== 'helipad' || b.rise < 1) continue;
       const p = proj(b.x, b.y + 12, b.z); if (!p.ok || p.x < -60 || p.x > W + 60 || p.y < -30 || p.y > H + 30) continue;
       const sw = 13, gap = 2, tw = AIRFIELD_SLOTS * (sw + gap) - gap;
       [[game.padLoad(b, true), '#57c8ff', '✈'], [game.padLoad(b, false), '#ffb03a', 'H']].forEach(([n, col, lab], r) => {
@@ -334,12 +351,12 @@ export class UI {
       if (b.dead || !b.obj.visible) continue;
       const sel = game.selection.has(b);
       if (!sel && hover !== b && b.hp >= b.maxHp) continue;
-      if (!sel && hover !== b && b.owner !== 0) continue;
+      if (!sel && hover !== b && !game.mine(b)) continue;
       const p = proj(b.x, b.y + 9, b.z); if (!p.ok) continue;
       const w = 30 + b.w * 12;
       bar(p.x, p.y, w, b.hp / b.maxHp, hpCol(b.hp / b.maxHp));
       if (b.repairing) { g.fillStyle = '#7bd3ff'; g.font = '700 12px Inter'; g.fillText('⚙ Reparatur', p.x - 34, p.y - 6); }
-      if (sel && b.owner === 0) {
+      if (sel && game.mine(b)) {
         // Rahmen
         const c = [[b.cx, b.cz], [b.cx + b.w, b.cz], [b.cx + b.w, b.cz + b.h], [b.cx, b.cz + b.h]].map(([x, z]) => proj(x * CELL, b.y + 0.4, z * CELL));
         g.strokeStyle = 'rgba(109,255,138,.8)'; g.lineWidth = 1.5;
@@ -400,7 +417,7 @@ export class UI {
     const game = this.game;
     $('endTitle').textContent = result === 'win' ? 'Sieg' : 'Niederlage';
     $('endTitle').className = result === 'win' ? 'win' : 'lose';
-    const rows = game.players.map((p) => `<tr><td style="color:${TEAMS[p.team].css}">${TEAMS[p.team].name}${p.human ? ' (Du)' : ''}</td><td>${p.stats.built}</td><td>${p.stats.lost}</td><td>${p.stats.kills}</td><td>${p.stats.bBuilt}</td><td>${p.stats.bLost}</td><td>${Math.round(p.stats.ore)}</td></tr>`).join('');
+    const rows = game.players.map((p) => `<tr><td style="color:${TEAMS[p.team].css}">${game.playerName(p)}${p === game.human ? ' (Du)' : !p.human ? ' (KI)' : ''}${game.net ? ` · Team ${p.ally + 1}` : ''}</td><td>${p.stats.built}</td><td>${p.stats.lost}</td><td>${p.stats.kills}</td><td>${p.stats.bBuilt}</td><td>${p.stats.bLost}</td><td>${Math.round(p.stats.ore)}</td></tr>`).join('');
     $('endStats').innerHTML = `<tr><th>Fraktion</th><th>Einheiten</th><th>Verloren</th><th>Abschüsse</th><th>Gebäude</th><th>Zerstört</th><th>Erz $</th></tr>${rows}`;
     $('end').classList.remove('hidden');
   }

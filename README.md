@@ -15,6 +15,18 @@ mit dem Fenster. Keine Installation von Node.js nötig. Protokoll: `%LOCALAPPDAT
 Paket bauen: `node tools/release.mjs 1.0.0` (Ergebnis in `dist/release/`), mit `--publish` zusätzlich Quelltext,
 Tag und GitHub-Release (braucht Node 22+ und die GitHub CLI).
 
+## Mehrspieler (online, bis zu 4 Spieler)
+Im Hauptmenü auf **Mehrspieler**, Serveradresse und Namen eingeben, **Verbinden**. Dann ein Spiel erstellen oder einem
+offenen Spiel bzw. per Raumcode beitreten. In der Lobby hat jeder der 4 Plätze: Mensch, Computer (mit Schwierigkeit),
+offen oder geschlossen, dazu Partei, Verbandsfarbe und **Team 1–4**. Verbündete greifen sich nicht an und teilen die
+Sicht. Der Gastgeber wählt den **Spielmodus**: *Jeder gegen jeden* (Standard), *2 gegen 2*, *2 gegen 1*, *3 gegen 1*
+(Teams 1/2 werden automatisch verteilt, tauschbar; Start nur mit passender Spielerzahl, Verbündete starten
+benachbart) oder *Eigene Teams* (Team 1–4 frei). Gewonnen hat das letzte verbleibende Team. Im Spiel: **Enter** = Nachricht an alle, Pausenmenü → „Spiel für alle
+anhalten“. Wer das Spiel verlässt, wird von der KI ersetzt.
+
+Dafür braucht es den Vermittlungsserver aus `netserver/` auf einem Rechner im Internet (Anleitung:
+`netserver/README.md`). Zum lokalen Testen: `node netserver/server.js` und im Spiel `ws://localhost:8091`.
+
 ## Starten (aus dem Quelltext)
 ```
 start.bat            (oder: node server.js 8090)

@@ -260,7 +260,7 @@ export class FX {
     const tmat = new THREE.ShaderMaterial({
       uniforms: this.trackU, transparent: true, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3,
       vertexShader: 'attribute vec2 aInfo; uniform float uTime, uLife; varying float vF; varying vec2 vUv; void main(){ vUv = uv; float k = (uTime - aInfo.x) / uLife; vF = aInfo.y * (1.0 - smoothstep(0.35, 1.0, k)) * step(k, 1.0); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
-      fragmentShader: 'uniform sampler2D map; varying float vF; varying vec2 vUv; void main(){ float a = texture2D(map, vUv).a * vF * 1.45; if (a < 0.004) discard; gl_FragColor = vec4(0.16, 0.12, 0.085, a); }',   // gedämpft: Spur dunkelt den Boden ab, statt ihn zu übermalen
+      fragmentShader: 'uniform sampler2D map; varying float vF; varying vec2 vUv; void main(){ float a = min(texture2D(map, vUv).a * vF * 0.7, 0.38); if (a < 0.004) discard; gl_FragColor = vec4(0.16, 0.12, 0.085, a); }',   // dezent: Spur dunkelt den Boden nur leicht ab (Deckkraft höchstens 0.38), statt ihn zu übermalen
     });
     this.tracks = new THREE.Mesh(tgeo, tmat);
     this.tracks.frustumCulled = false; this.tracks.renderOrder = 8; this.trackI = 0; this.trackLo = 1e9; this.trackHi = -1;

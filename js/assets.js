@@ -465,6 +465,7 @@ function instFigure(id, team) {
   const legs = [root.getObjectByName('LegL'), root.getObjectByName('LegR')];
   const y0 = torso.position.y;
   const st = { mode: 'idle', ph: Math.random() * 6, run: 0, t: Math.random() * 9 };
+  nodes.phase = (ph, t) => { st.ph = ph; st.t = t; };   // Simulation setzt die Phase (Mehrspieler: Mündungslage muss auf allen Rechnern gleich sein)
   const mk = (name) => {
     const a = { paused: false, play() { st.mode = name; a.paused = false; return a; }, reset() { a.paused = false; return a; }, fadeIn() { st.mode = name; return a; }, fadeOut() { return a; } };
     return a;

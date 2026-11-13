@@ -21,6 +21,20 @@ const NEVER = [/^assets\/models\/soldier\.glb$/, /^assets\/raw\//, /^dist\//];
 
 const run = (cmd, args, opts = {}) => execFileSync(cmd, args, { stdio: 'inherit', ...opts });
 const out = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: 'utf8', ...opts }).trim();
+
+// Entwickelt wird im privaten Repository (Dinge). Das öffentliche Repository bekommt nur vollständige Updates,
+// und zwar genau einen im privaten Repository committeten Stand – nie halbfertige Änderungen aus dem Arbeitsbaum.
+let srcCommit = '';
+if (publish) {
+  const dirty = out('git', ['status', '--porcelain', '.'], { cwd: ROOT });
+  if (dirty) {
+    console.error('Abbruch: Im Spielordner gibt es nicht committete Änderungen. Erst im privaten Repository committen, dann veröffentlichen.\n' + dirty);
+    process.exit(1);
+  }
+  srcCommit = out('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT });
+  const tags = out('git', ['ls-remote', '--tags', REPO, `refs/tags/v${version}`], { cwd: ROOT });
+  if (tags) { console.error(`Abbruch: v${version} ist schon veröffentlicht. Für ein Update eine höhere Version angeben.`); process.exit(1); }
+}
 const sha256 = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 const mb = (f) => (fs.statSync(f).size / 1048576).toFixed(1) + ' MB';
 
@@ -37,7 +51,7 @@ function runtimeFiles(all) {
   const tex = new Set([...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).concat(['emblems', 'water']));
   return all.filter((f) => {
     if (f === 'index.html' || /^(css|js|vendor)\//.test(f)) return true;
-    if (/^assets\/(models|props|hdri)\//.test(f) || f === 'assets/title.webp') return true;
+    if (/^assets\/(models|props|hdri)\//.test(f) || f === 'assets/title.webp' || f === 'favicon.ico') return true;
     const t = f.match(/^assets\/textures\/([^/]+)\//);
     return !!(t && tex.has(t[1]));
   });
@@ -56,6 +70,17 @@ function buildExe(dir) {
   run(process.execPath, ['--experimental-sea-config', path.join(work, 'sea-config.json')]);
   const exe = path.join(dir, GAME + '.exe');
   fs.copyFileSync(process.execPath, exe);
+  // Programmsymbol + Versionsangaben einbetten (vor postject); Fehler sind nicht schlimm
+  try {
+    // rcedit@4 ist nur eine Bibliothek (kein npx-Programm): in den Arbeitsordner installieren und per Skript aufrufen
+    run('npm', ['install', '--no-audit', '--no-fund', '--prefix', work, 'rcedit@4'], { shell: true });
+    const rc = path.join(work, 'rcedit-run.mjs');
+    fs.writeFileSync(rc, `import rcedit from 'rcedit';
+await rcedit(${JSON.stringify(exe)}, { icon: ${JSON.stringify(path.join(ROOT, 'assets/icon.ico'))},
+  'version-string': { ProductName: 'Atomic Dawn', FileDescription: 'Atomic Dawn', OriginalFilename: ${JSON.stringify(GAME + '.exe')} } });
+`);
+    run(process.execPath, [rc]);
+  } catch (e) { console.warn('WARNUNG: Symbol konnte nicht eingebettet werden (rcedit): ' + e.message); }
   run('npx', ['--yes', 'postject@1.0.0-alpha.6', exe, 'NODE_SEA_BLOB', blob, '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2', '--overwrite'], { shell: true });
   setGuiSubsystem(exe);
   return exe;
@@ -95,6 +120,9 @@ const files = runtimeFiles(all);
 copyList(files, stage);
 buildExe(stage);
 fs.writeFileSync(path.join(stage, 'version.txt'), version + '\n');
+// Spielversion im Code (Mehrspieler: nur gleiche Versionen spielen zusammen)
+const vf = path.join(stage, 'js/version.js');
+fs.writeFileSync(vf, fs.readFileSync(vf, 'utf8').replace("VERSION = 'dev'", `VERSION = '${version}'`));
 fs.copyFileSync(path.join(ROOT, 'vendor/three/LICENSE'), path.join(stage, 'vendor/three/LICENSE'));
 
 const zipName = `${GAME}-Client-${version}-win-x64.zip`;
@@ -113,6 +141,12 @@ if (publish) {
   // Anmeldung über die GitHub CLI – nur in diesem Klon (keine globale git-Einstellung)
   run('git', ['config', '--local', '--replace-all', 'credential.helper', ''], { cwd: repo });
   run('git', ['config', '--local', '--add', 'credential.helper', `!'${gh}' auth git-credential`], { cwd: repo });
+  // Autor = angemeldetes GitHub-Konto mit noreply-Adresse – sonst nimmt git die globale
+  // Identität (Firmenadresse), und GitHub ordnet den Commit einem anderen Konto zu.
+  const [login, id] = out(gh, ['api', 'user', '--jq', '.login, .id']).split(/\s+/);
+  if (!login || !/^\d+$/.test(id || '')) { console.error('Abbruch: GitHub-Konto nicht ermittelbar (gh auth status).'); process.exit(1); }
+  run('git', ['config', '--local', 'user.name', login], { cwd: repo });
+  run('git', ['config', '--local', 'user.email', `${id}+${login}@users.noreply.github.com`], { cwd: repo });
   run('git', ['fetch', 'origin'], { cwd: repo });
   if (out('git', ['branch', '-r'], { cwd: repo }).includes('origin/main')) run('git', ['merge', '--ff-only', 'origin/main'], { cwd: repo });
   // Quelltext spiegeln: versionierte Dateien rein, alles andere (außer .git) raus
@@ -123,9 +157,9 @@ if (publish) {
   fs.writeFileSync(path.join(repo, '.gitignore'), 'assets/raw/\ndist/\nnode_modules/\n*.blend1\n');
   run('git', ['add', '-A'], { cwd: repo });
   if (out('git', ['status', '--porcelain'], { cwd: repo })) {
-    run('git', ['commit', '-q', '-m', `Atomic Dawn ${version}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`], { cwd: repo });
+    run('git', ['commit', '-q', '-m', `Atomic Dawn ${version}\n\nStand des Entwicklungs-Repositorys: ${srcCommit}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`], { cwd: repo });
   }
-  run('git', ['tag', '-f', `v${version}`], { cwd: repo });
+  run('git', ['tag', `v${version}`], { cwd: repo });
   run('git', ['push', '-u', 'origin', 'HEAD:main'], { cwd: repo });
   run('git', ['push', 'origin', `v${version}`], { cwd: repo });
   run(gh, ['release', 'create', `v${version}`, zip, path.join(rel, 'SHA256SUMS.txt'), path.join(rel, 'titelbild.jpg'),

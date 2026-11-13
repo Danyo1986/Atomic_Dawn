@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
-import { CELL, WORLD, UNITS, BUILDINGS, TEAMS, FACTIONS, setupTeams } from './config.js';
+import { CELL, WORLD, UNITS, BUILDINGS, TEAMS, FACTIONS, DIFFICULTY, setupTeams } from './config.js';
 import { A, loadAll, renderThumbs, clearMaterials } from './assets.js';
 import { Terrain, baseWorld } from './terrain.js';
 import { FX } from './fx.js';
@@ -15,15 +15,36 @@ import { AI } from './ai.js';
 import { UI } from './ui.js';
 import { Input } from './input.js';
 import { FOG } from './fog.js';
-import { initAudio, setVolume, say } from './audio.js';
+import { initAudio, setVolume, say, AUDIO } from './audio.js';
+import { Demo } from './demo.js';
+import { seedRand } from './rng.js';
+import { Net } from './net.js';
+import { Lobby } from './lobby.js';
+import * as menuFx from './menufx.js';   // Startbildschirm-Optik: Intro, Glut, Blende, Einsatz-Briefing (nur Darstellung)
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
 
+const net = new Net();
 const app = {
-  state: 'loading', paused: false, game: null, terrain: null, scene: null, ais: [],
-  pause() { if (this.state !== 'game') return; this.paused = true; $('pause').classList.remove('hidden'); },
+  state: 'loading', paused: false, game: null, terrain: null, scene: null, ais: [], net,
+  /** Pausenmenü. Allein hält es das Spiel an; im Mehrspieler läuft das Spiel weiter (anhalten für alle: eigener Knopf) */
+  pause() {
+    if (this.state !== 'game') return;
+    this.paused = true; $('pause').classList.remove('hidden');
+    const mp = !!(this.game && this.game.net);
+    $('btnNetPause').classList.toggle('hidden', !mp);
+    $('btnNetPause').textContent = net.paused ? 'Spiel für alle fortsetzen' : 'Spiel für alle anhalten';
+    $('netPauseInfo').textContent = mp ? 'Mehrspieler: Das Spiel läuft im Hintergrund weiter.' : '';
+  },
   resume() { this.paused = false; $('pause').classList.add('hidden'); },
+  /** Spielerbefehl (input.js / ui.js): allein sofort ausführen (Rückgabe = Erfolg), im Mehrspieler an den Server */
+  cmd(c) {
+    const g = this.game;
+    if (!g || this.state !== 'game') return false;
+    if (g.net) { if (!net.connected) return false; net.cmd(c); return undefined; }
+    return g.exec(g.me, c);
+  },
 };
 window.APP = app; // für Fehlersuche
 app.FOG = FOG;
@@ -109,7 +130,7 @@ window.addEventListener('resize', resize);
 // ------------------------------------------------------------------ Laden
 async function boot() {
   resize();
-  await loadAll(renderer, (f) => { $('loadFill').style.width = (f * 100).toFixed(0) + '%'; });
+  await loadAll(renderer, (f) => { $('loadFill').style.width = (f * 100).toFixed(0) + '%'; menuFx.progress(f); });   // menuFx: Prozent + Ladeschritte
   $('loadTxt').textContent = 'Erzeuge Vorschaubilder …';
   await new Promise((r) => setTimeout(r, 30));
   const list = [];
@@ -123,8 +144,8 @@ async function boot() {
   requestAnimationFrame(loop);
 }
 
-function buildWorld(seed, players) {
-  quality = $('optGfx').value;
+function buildWorld(seed, players, gfx = null) {
+  quality = gfx || $('optGfx').value;
   setupScene();
   resize();
   const t = new Terrain(seed, players);
@@ -142,8 +163,9 @@ function showMenu() {
   FOG.uniforms.uFogOn.value = 0;
   FOG.enabled = false; FOG.data.fill(255); FOG.tex.needsUpdate = true;
   buildWorld(1, 4);
-  app.input.lookAt(WORLD / 2, WORLD / 2); app.input.distT = 170; app.input.dist = 170;
+  app.demo = new Demo(app, scene, app.terrain, fx);   // Live-Gefecht hinter dem Menü (js/demo.js)
   resize();
+  menuFx.menuShown();   // Intro (nur beim ersten Mal), Glut-Partikel, Parallaxe
 }
 
 /** Bedienoberfläche in der Farbe der eigenen Partei */
@@ -155,45 +177,59 @@ function setFactionStyle(f) {
 }
 
 /** Farbwahl im Menü: Farbfelder der gewählten Partei, Auswahl je Partei gemerkt (Index in FACTIONS[..].colors) */
-const colorSel = { allies: 0, axis: 0 };
+const colorSel = { allies: 0, axis: 1 };   // Vorgabe: Allianz Blau, Achsenmacht Rot (Index in COLORS)
 function buildColorPicker() {
   const f = $('optFaction').value, box = $('optColor');
   box.innerHTML = '';
-  FACTIONS[f].colors.forEach(([, css, name], i) => {
+  FACTIONS[f].colors.forEach(([, css, unit, name], i) => {
     const b = document.createElement('button');
-    b.type = 'button'; b.title = name; b.style.background = css;
+    b.type = 'button'; b.title = name + ' · ' + unit; b.style.background = css;
     b.classList.toggle('on', i === colorSel[f]);
     b.onclick = () => { colorSel[f] = i; buildColorPicker(); };
     box.appendChild(b);
   });
-  $('colorName').textContent = FACTIONS[f].colors[colorSel[f]][2];
+  const c = FACTIONS[f].colors[colorSel[f]]; $('colorName').textContent = c[3] + ' · ' + c[2];
 }
 $('optFaction').addEventListener('change', buildColorPicker);
 buildColorPicker();
 
+/** Gefecht allein: Du gegen Computergegner der anderen Partei, jeder gegen jeden */
 function startGame() {
+  const n = 1 + parseInt($('optEnemies').value, 10);
+  const mine = $('optFaction').value, other = mine === 'allies' ? 'axis' : 'allies', diff = $('optDiff').value;
+  launchGame({
+    seed: 1 + Math.floor(Math.random() * 2 ** 30), map: parseInt($('optMap').value, 10) || 1 + Math.floor(Math.random() * 99999),
+    credits: parseInt($('optCredits').value, 10), fog: $('optFog').value === '1', gfx: $('optGfx').value, me: 0, net: false,
+    players: Array.from({ length: n }, (_, i) => ({ human: i === 0, faction: i ? other : mine, color: i ? null : colorSel[mine], ally: i, diff })),
+  });
+}
+
+/** Gefecht starten (allein oder Mehrspieler). cfg: seed (Zufall der Simulation), map (Karten-Seed), credits, fog, gfx, me,
+ *  net, players[i] = { human, name, faction, color, ally, diff }. Im Mehrspieler bekommen alle Rechner dieselbe cfg vom Server. */
+function launchGame(cfg) {
   initAudio();
-  const players = 1 + parseInt($('optEnemies').value, 10);
-  let seed = parseInt($('optMap').value, 10);
-  if (!seed) seed = 1 + Math.floor(Math.random() * 99999);
-  $('menu').classList.add('hidden');
-  $('loading').classList.remove('hidden'); $('loadTxt').textContent = 'Erzeuge Schlachtfeld …'; $('loadFill').style.width = '100%';
-  // Parteien: Du gegen die andere Partei; Vorschaubilder und Materialien in den Parteifarben neu erzeugen
-  const mine = $('optFaction').value, other = mine === 'allies' ? 'axis' : 'allies';
-  setupTeams([mine, ...Array(players - 1).fill(other)], [colorSel[mine]]);
+  app.demo = null; AUDIO.speech = true; AUDIO.sfx = 1;   // Menü-Gefecht endet
+  const players = cfg.players.length, me = cfg.me;
+  // Menü → Ladebildschirm über menuFx: Blende, Einsatz-Briefing (Karte, Partei, Ladeschritte); liefert die Wartezeit bis zum Aufbau
+  const wait = menuFx.launch(cfg);
+  seedRand(cfg.seed);
+  // Parteien und Verbandsfarben; Vorschaubilder und Materialien in den Parteifarben neu erzeugen
+  setupTeams(cfg.players.map((p) => p.faction), cfg.players.map((p) => p.color));
   clearMaterials();
+  const mine = cfg.players[me].faction;
   setFactionStyle(mine);
   setTimeout(() => {
-    renderThumbs(renderer, app.thumbList, 0);
-    const terrain = buildWorld(seed, players);
-    const opts = { players, credits: parseInt($('optCredits').value, 10), difficulty: $('optDiff').value };
+    renderThumbs(renderer, app.thumbList, me);
+    const terrain = buildWorld(cfg.map, players, cfg.gfx);
+    const opts = { players, credits: cfg.credits, net: cfg.net, fog: cfg.fog, me,
+      slots: cfg.players.map((p) => ({ human: p.human, name: p.name || '', ally: p.ally, diff: p.diff || 'normal' })) };
     const game = new Game(scene, terrain, fx, opts);
     app.game = game;
     app.miniBase = terrain.minimapCanvas(256);
-    FOG.enabled = $('optFog').value === '1';
+    FOG.enabled = cfg.fog;
     FOG.explored.fill(0); FOG.visible.fill(0); FOG.data.fill(FOG.enabled ? 0 : 255); FOG.tex.needsUpdate = true;
     FOG.uniforms.uFogOn.value = FOG.enabled ? 1 : 0;
-    // Startaufstellung
+    // Startaufstellung (Computergegner entfalten ihre Basis nach kurzer Zeit – im Spieltakt, damit alle Rechner gleich rechnen)
     for (let i = 0; i < players; i++) {
       const b = baseWorld(i);
       const c = WORLD / 2, a = Math.atan2(c - b.z, c - b.x);
@@ -202,32 +238,98 @@ function startGame() {
       let p = fwd(16, -6); game.spawnUnit('tank', i, p.x, p.z, a);
       p = fwd(16, 6); game.spawnUnit('ifv', i, p.x, p.z, a);
       for (let k = 0; k < 4; k++) { p = fwd(22, -6 + k * 4); game.spawnUnit(k < 3 ? 'rifle' : 'rocket', i, p.x, p.z, a); }
-      if (i > 0) setTimeout(() => game.cmdDeploy(m), 1500 + i * 400);
+      if (!game.players[i].human) game.after(1.5 + i * 0.4, () => { if (!m.dead && !m.removed) game.cmdDeploy(m); });
     }
     app.ais = game.players.filter((p) => !p.human).map((p) => new AI(game, p));
-    const hb = baseWorld(0);
+    const hb = baseWorld(me);
     app.input.lookAt(hb.x + 10, hb.z + 10); app.input.distT = 90;
     app.input.yaw = app.input.yawT = 0; // Norden oben, wie auf der Radarkarte
     document.body.classList.remove('ingame-hidden');
     resize();
     app.ui.tab = 'bld'; app.ui.renderGrid();
-    $('loading').classList.add('hidden');
-    app.state = 'game';
+    menuFx.loaded();   // restliche Ladeschritte abhaken, Ladebildschirm ausblenden
+    app.state = 'game'; app.endShown = false;
     game.updateFogOfWar();
     app.ui.message('Mobile Basis auswählen und D drücken (oder doppelt anklicken), um das Hauptquartier zu errichten.');
-    app.ui.message('Du führst die ' + FACTIONS[mine].name + ' gegen die ' + FACTIONS[other].name + '.');
+    if (cfg.net) {
+      const allies = game.players.filter((p) => p !== game.human && p.ally === game.human.ally).map((p) => game.playerName(p));
+      app.ui.message(allies.length ? 'Verbündete: ' + allies.join(', ') : 'Du kämpfst ohne Verbündete.');
+      app.ui.message('Enter: Nachricht an alle.');
+      $('loadTxt').textContent = 'Warte auf Mitspieler …';
+    } else {
+      const other = mine === 'allies' ? 'axis' : 'allies';
+      app.ui.message('Du führst die ' + FACTIONS[mine].name + ' gegen die ' + FACTIONS[other].name + '.');
+    }
     say('Willkommen, Kommandant');
-    game.selection.add(game.units.find((u) => u.owner === 0 && u.type === 'mcv'));
-  }, 50);
+    game.selection.add(game.units.find((u) => game.mine(u) && u.type === 'mcv'));
+    if (cfg.net) net.send({ t: 'loaded' });
+  }, wait);
+}
+
+// ------------------------------------------------------------------ Mehrspieler
+const lobby = new Lobby(app, net);
+app.startNet = (cfg, me) => launchGame({ ...cfg, me, net: true, gfx: $('netGfx').value });
+/** Befehle eines Takts auf allen Rechnern in gleicher Reihenfolge ausführen; '_drop' = Spieler hat verlassen, die KI übernimmt */
+function applyTurn(list) {
+  const g = app.game;
+  for (const { p, c } of list) {
+    if (c.op === '_drop') {
+      const P = g.players[p];
+      if (!P || !P.human) continue;
+      P.human = false; P.diff = DIFFICULTY.normal;
+      app.ais.push(new AI(g, P));
+      if (P !== g.human) app.ui.message(g.playerName(P) + ' hat das Spiel verlassen – die KI übernimmt.', true);
+      continue;
+    }
+    g.exec(p, c);
+  }
+}
+/** eingegangene Takte abarbeiten (Hauptschleife; zum Testen auch von Hand: APP.pumpNet(sekunden)) */
+app.pumpNet = (dt) => {
+  const g = app.game;
+  return net.pump(dt, applyTurn, (h) => { g.update(h); for (const ai of app.ais) ai.update(h); }, () => g.checksum());
+};
+app.netChat = (m) => {
+  if (m.sys) { app.ui.message(m.text); return; }
+  const g = app.game, P = g && m.slot >= 0 ? g.players.find((p) => p.name === m.from) : null;
+  app.ui.chat(m.from, m.text, P ? TEAMS[P.team].css : '#fff');
+};
+net.on('paused', (m) => { if (app.state === 'game') { app.ui.message(m.on ? `${m.by} hat das Spiel angehalten.` : `${m.by} setzt das Spiel fort.`, m.on); if (app.paused) app.pause(); } })
+  .on('desync', () => { if (app.state === 'game') app.ui.message('Achtung: Die Rechner sind nicht mehr gleich (asynchron). Bitte das Spiel neu starten.', true); })
+  .on('disconnect', () => {
+    if (app.state === 'game' && app.game && app.game.net) {
+      app.ui.message('Verbindung zum Server verloren – das Spiel ist angehalten.', true);
+      app.pause(); $('netPauseInfo').textContent = 'Verbindung zum Server verloren. Bitte zum Hauptmenü zurückkehren.';
+      $('btnNetPause').classList.add('hidden');
+    }
+  });
+$('btnNetPause').onclick = () => { net.send({ t: 'pause', on: !net.paused }); app.resume(); };
+/** Chat im Spiel: Enter öffnet das Eingabefeld */
+const chatIn = $('gameChat');
+document.addEventListener('keydown', (e) => {
+  if (app.state !== 'game' || !app.game || !app.game.net || e.key !== 'Enter' || document.activeElement === chatIn) return;
+  e.preventDefault(); chatIn.style.display = 'block'; chatIn.focus();
+});
+chatIn.addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.key === 'Enter') { const t = chatIn.value.trim(); if (t) net.send({ t: 'chat', text: t }); }
+  if (e.key === 'Enter' || e.key === 'Escape') { chatIn.value = ''; chatIn.style.display = 'none'; chatIn.blur(); }
+});
+chatIn.addEventListener('keyup', (e) => e.stopPropagation());
+/** Spiel verlassen: im Mehrspieler zurück in die Raumliste (die KI übernimmt den eigenen Platz) */
+function quitGame() {
+  if (app.game && app.game.net) { net.send({ t: 'leave' }); net.reset(); }
+  app.resume(); showMenu();
+  lobby.tab(!!(app.game === null && net.connected)); lobby.show();
 }
 
 $('btnStart').onclick = startGame;
 $('btnResume').onclick = () => app.resume();
-$('btnQuit').onclick = () => { app.resume(); showMenu(); };
-$('btnAgain').onclick = () => showMenu();
+$('btnQuit').onclick = () => quitGame();
+$('btnAgain').onclick = () => quitGame();
 $('btnMenu').onclick = () => app.pause();
 $('optVol').oninput = (e) => setVolume(parseFloat(e.target.value));
-document.addEventListener('visibilitychange', () => { if (document.hidden && app.state === 'game') app.pause(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && app.state === 'game' && !(app.game && app.game.net)) app.pause(); });
 
 // ------------------------------------------------------------------ Hauptschleife
 let last = performance.now();
@@ -268,8 +370,18 @@ function loop(now) {
   if (!scene) return;
   const game = app.game;
   if (app.state === 'menu') {
-    app.input.yawT += dt * 0.04;
+    if (app.demo) app.demo.update(dt);
     app.input.update(dt);
+  } else if (app.state === 'game' && game.net) {
+    // Mehrspieler: feste Simulationsschritte nach den Takten des Servers (läuft auch bei offenem Pausenmenü weiter)
+    app.pumpNet(dt);
+    app.input.update(dt);
+    if (game.over && !app.endShown) { app.endShown = true; setTimeout(() => app.ui.showEnd(game.over), 2500); }
+    const badge = $('netBadge'), lag = net.lag();
+    badge.style.display = net.paused || lag > 0.6 || !net.go ? 'block' : 'none';
+    badge.textContent = !net.go ? 'Warte auf Mitspieler …' : net.paused ? 'Angehalten' : `Hole auf … ${lag.toFixed(1)} s`;
+    badge.classList.toggle('warn', net.paused || !net.connected);
+    app.ui.update(dt);
   } else if (app.state === 'game') {
     if (!app.paused) {
       game.update(dt);
@@ -280,7 +392,7 @@ function loop(now) {
     }
     app.ui.update(dt);
   }
-  if (!app.paused) fx.update(dt, game ? game.projectiles.filter((p) => p.rocket && p.vis) : []);
+  if (!app.paused || (game && game.net && !net.paused)) fx.update(dt, (game || (app.demo && app.demo.game) || { projectiles: [] }).projectiles.filter((p) => p.rocket && p.vis));
   if (app.terrain && app.terrain.water) app.terrain.water.material.normalMap.offset.set(now * 0.000012, now * 0.000008);
   // Schatten nur jedes 2. Bild neu (Hauptkosten); dann Schattenkamera eng an den Bildausschnitt anpassen
   shadowFrame++;

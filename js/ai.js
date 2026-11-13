@@ -1,6 +1,7 @@
 // Computergegner: Basisaufbau, Wirtschaft, Armee, Angriffswellen, Verteidigung
 import { CELL, MAPN, WORLD, BUILDINGS, UNITS, NUKE } from './config.js';
 import { dist, dist2 } from './util.js';
+import { rand } from './rng.js';
 import { baseWorld } from './terrain.js';
 
 const ORDER = ['power', 'refinery', 'barracks', 'power', 'factory', 'radar', 'turret', 'refinery', 'power', 'samturret', 'turret', 'helipad', 'power', 'silo', 'turret', 'barracks', 'factory', 'power', 'samturret', 'turret', 'refinery', 'power', 'turret', 'power', 'tesla', 'prism'];
@@ -8,12 +9,12 @@ const ORDER = ['power', 'refinery', 'barracks', 'power', 'factory', 'radar', 'tu
 export class AI {
   constructor(game, player) {
     this.g = game; this.p = player;
-    this.t = Math.random();
+    this.t = rand();
     this.step = 0;
     this.wave = 0;
     this.waveSize = player.diff.wave;
     this.home = baseWorld(player.id);
-    this.attackCooldown = player.diff.first * (0.75 + 0.2 * player.id + Math.random() * 0.15); // Gegner greifen versetzt an // erste Welle erst nach einigen Minuten
+    this.attackCooldown = player.diff.first * (0.75 + 0.2 * player.id + rand() * 0.15); // Gegner greifen versetzt an // erste Welle erst nach einigen Minuten
     this.defendT = 0;
   }
 
@@ -29,7 +30,7 @@ export class AI {
     // Mobile Basis entfalten
     if (!hq) {
       for (const u of mine) if (u.type === 'mcv' && !u.path.length) {
-        if (!g.cmdDeploy(u)) g.cmdMove([u], u.x + (Math.random() - 0.5) * 30, u.z + (Math.random() - 0.5) * 30, false, true);
+        if (!g.cmdDeploy(u)) g.cmdMove([u], u.x + (rand() - 0.5) * 30, u.z + (rand() - 0.5) * 30, false, true);
       }
     }
     if (hq) this.home = { x: hq.x, z: hq.z };
@@ -45,17 +46,17 @@ export class AI {
     if (!s) return;
     let best = null, bv = 0;
     for (const b of g.buildings) {
-      if (b.dead || b.owner === p.id || !g.players[b.owner].alive) continue;
+      if (b.dead || g.allied(b.owner, p.id) || !g.players[b.owner].alive) continue;
       let v = 0, own = false;
       for (const o of g.buildings) {
         if (o.dead || dist(o.x, o.z, b.x, b.z) > NUKE.radius) continue;
-        if (o.owner === p.id) own = true; else v += o.def.cost;
+        if (g.allied(o.owner, p.id)) own = true; else v += o.def.cost;   // eigene und verbündete Gebäude nicht treffen
       }
       if (own) continue;
       if (g.players[b.owner].human) v /= p.diff.focus;   // Schwierigkeit: wie sehr der Mensch bevorzugt bzw. geschont wird
       if (v > bv) { bv = v; best = b; }
     }
-    if (best) g.launchNuke(s, best.x + (Math.random() - 0.5) * 6, best.z + (Math.random() - 0.5) * 6);
+    if (best) g.launchNuke(s, best.x + (rand() - 0.5) * 6, best.z + (rand() - 0.5) * 6);
   }
 
   build(hq) {
@@ -82,7 +83,7 @@ export class AI {
           if (have >= want) { this.step++; continue; }
           next = t; break;
         }
-        if (!next && p.credits > 3000 && Math.random() < 0.3) next = Math.random() < 0.5 ? 'power' : 'refinery';
+        if (!next && p.credits > 3000 && rand() < 0.3) next = rand() < 0.5 ? 'power' : 'refinery';
         // Flugfelder voll belegt: bis zu zwei weitere bauen, um die Luftflotte zu vergrößern
         if (!next && p.credits > 2500 && (p.count.helipad || 0) > 0 && (p.count.helipad || 0) < 3 && !g.freePad(p, true) && !g.freePad(p, false)) next = 'helipad';
       }
@@ -98,8 +99,8 @@ export class AI {
     const towards = Math.atan2(c - this.home.z, c - this.home.x);
     let best = null, bs = -1e9;
     for (let i = 0; i < 160; i++) {
-      let a = Math.random() * Math.PI * 2, r = 3 + Math.random() * 12;
-      if (d.key === 'def') { a = towards + (Math.random() - 0.5) * 1.8; r = 8 + Math.random() * 6; }
+      let a = rand() * Math.PI * 2, r = 3 + rand() * 12;
+      if (d.key === 'def') { a = towards + (rand() - 0.5) * 1.8; r = 8 + rand() * 6; }
       const cx = Math.round(hc.x + Math.cos(a) * r - d.w / 2), cz = Math.round(hc.z + Math.sin(a) * r - d.h / 2);
       if (!g.canPlace(p, type, cx, cz)) continue;
       // Abstand zu anderen Gebäuden halten (Wege frei)
@@ -113,7 +114,7 @@ export class AI {
         const k = g.findOre((cx + 2) * CELL, (cz + 1) * CELL, null, 30);
         if (k >= 0) s -= Math.sqrt(dist2((cx + 2) * CELL, (cz + 1) * CELL, (k % MAPN) * CELL, Math.floor(k / MAPN) * CELL)) * 0.3;
       }
-      s += Math.random();
+      s += rand();
       if (s > bs) { bs = s; best = [cx, cz]; }
     }
     return best;
@@ -132,16 +133,16 @@ export class AI {
       let t = null;
       if (refs && harv < Math.min(refs * 2, 4) && g.canBuild(p, 'harvester')) t = 'harvester';
       else {
-        const r = Math.random();
+        const r = rand();
         if (capped) t = null; else if (r < 0.36) t = 'tank'; else if (r < 0.48) t = 'buggy'; else if (r < 0.65) t = 'ifv'; else if (r < 0.8) t = 'flak'; else t = g.canBuild(p, 'artillery') ? 'artillery' : 'tank';
         if (!(p.count.hq) && !mine.some((u) => u.type === 'mcv') && g.canBuild(p, 'mcv')) t = 'mcv';
       }
       if (t && g.canBuild(p, t)) g.queueItem(p, t);
     }
     const qi = p.queues.inf;
-    if (!capped && qi.list.length < 2 && p.credits > reserve + 150 && g.canBuild(p, 'rifle')) g.queueItem(p, Math.random() < 0.55 ? 'rifle' : 'rocket');
+    if (!capped && qi.list.length < 2 && p.credits > reserve + 150 && g.canBuild(p, 'rifle')) g.queueItem(p, rand() < 0.55 ? 'rifle' : 'rocket');
     const qa = p.queues.air;
-    if (!capped && qa.list.length < 1 && p.credits > reserve + 1500 && g.canBuild(p, 'heli') && Math.random() < p.diff.air) g.queueItem(p, g.canBuild(p, 'jet') && g.freePad(p, true) && Math.random() < 0.4 ? 'jet' : 'heli');
+    if (!capped && qa.list.length < 1 && p.credits > reserve + 1500 && g.canBuild(p, 'heli') && rand() < p.diff.air) g.queueItem(p, g.canBuild(p, 'jet') && g.freePad(p, true) && rand() < 0.4 ? 'jet' : 'heli');
   }
 
   army(mine) {
@@ -160,7 +161,7 @@ export class AI {
     const c = WORLD / 2;
     const ang = Math.atan2(c - this.home.z, c - this.home.x);
     const rally = { x: this.home.x + Math.cos(ang) * 40, z: this.home.z + Math.sin(ang) * 40 };
-    for (const u of idle) if (!u.attacking && !u.def.jet && dist(u.x, u.z, rally.x, rally.z) > 25 && !u.target) g.cmdMove([u], rally.x + (Math.random() - 0.5) * 20, rally.z + (Math.random() - 0.5) * 20, false, true);
+    for (const u of idle) if (!u.attacking && !u.def.jet && dist(u.x, u.z, rally.x, rally.z) > 25 && !u.target) g.cmdMove([u], rally.x + (rand() - 0.5) * 20, rally.z + (rand() - 0.5) * 20, false, true);
     // Angriffswelle
     const ready = combat.filter((u) => !u.attacking);
     if (ready.length >= this.waveSize && this.attackCooldown <= 0) {
@@ -173,7 +174,7 @@ export class AI {
         for (const u of wave) { u.attacking = true; u.waveTarget = target.id; }
         this.wave++;
         this.waveSize = Math.min(p.diff.max, p.diff.wave + this.wave * p.diff.grow);
-        this.attackCooldown = p.diff.cool * (0.85 + Math.random() * 0.3);
+        this.attackCooldown = p.diff.cool * (0.85 + rand() * 0.3);
       }
     }
     // Angreifer ohne Auftrag weiterschicken
@@ -188,14 +189,14 @@ export class AI {
     const o = from || this.home;
     let best = null, bd = 1e18;
     for (const b of g.buildings) {
-      if (b.owner === p.id || b.dead) continue;
+      if (g.allied(b.owner, p.id) || b.dead) continue;
       let d = dist2(o.x, o.z, b.x, b.z);
-      if (b.owner === 0) d *= p.diff.focus; // Vorliebe für den Menschen je nach Stufe
+      if (g.players[b.owner].human) d *= p.diff.focus; // Vorliebe für Menschen je nach Stufe
       if (b.def.weapon) d *= 1.3;
       if (b.def.wall) d *= 6;
       if (d < bd) { bd = d; best = b; }
     }
-    if (!best) for (const u of g.units) if (u.owner !== p.id && !u.dead) { const d = dist2(o.x, o.z, u.x, u.z); if (d < bd) { bd = d; best = u; } }
+    if (!best) for (const u of g.units) if (!g.allied(u.owner, p.id) && !u.dead) { const d = dist2(o.x, o.z, u.x, u.z); if (d < bd) { bd = d; best = u; } }
     return best;
   }
 }

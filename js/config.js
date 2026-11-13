@@ -18,29 +18,33 @@ export const WATER_LEVEL = -1.2;
 export const FACTIONS = {
   // pattern = Tarnflecken auf Lack (olive) und Uniform: [dunkel, hell, schwarz]
   allies: { name: 'Allianz', camo: [0.34, 0.48, 0.7], paint: 0x56687e, olive: 0x7d93b0, gear: 0x3a4a5e, cloth: 0x8d9db3, uniform: 0x7088a6, pattern: [0x4a5d78, 0xb3c1d2, 0x283140],
-    css: ['#3f8bea', '#9cc8ff'],
-    colors: [[0x2f7bd9, '#3f8bea', '1. Panzerarmee'], [0x1fb4d8, '#33c4e2', 'Küstenkorps'], [0x6d6cf2, '#8a87ff', 'Luftlandedivision'], [0x9cc4ff, '#a9cbff', 'Nordflotte'],
-      [0x22c48a, '#3ad49a', 'Gebirgsjäger'], [0x7cd23a, '#8fe04a', 'Grenzwacht'], [0xf2c230, '#f6d04a', 'Wüstenkorps'], [0xe6e8f0, '#f0f1f6', 'Ehrengarde']] },
+    css: ['#3f8bea', '#9cc8ff'], units: ['1. Panzerarmee', 'Rote Brigade', 'Grenzwacht', 'Wüstenkorps', 'Luftlandedivision', 'Küstenkorps', 'Nordflotte', 'Ehrengarde'] },
   axis: { name: 'Achsenmacht', camo: [0.72, 0.3, 0.22], paint: 0x7c4639, olive: 0xa25a48, gear: 0x5a332b, cloth: 0xab7c68, uniform: 0x8e5c48, pattern: [0x683a2d, 0xc99c74, 0x30211c],
-    css: ['#e2483a', '#ff9c84'],
-    colors: [[0xd23a2a, '#e04a3a', 'Rote Garde'], [0xea7e22, '#f0923a', 'Stahlfront'], [0xb81f5c, '#d0306a', 'Sturmlegion'], [0xff6a5a, '#ff7a6a', 'Eisenbrigade'],
-      [0xe0c020, '#ecd040', 'Sonnenlegion'], [0xc040d0, '#d060e0', 'Schattenkorps'], [0x8f2bd8, '#a04ae8', 'Purpurgarde'], [0xf0e6d0, '#f6eedc', 'Knochenlegion']] },
+    css: ['#e2483a', '#ff9c84'], units: ['Eisenbrigade', 'Rote Garde', 'Waldlegion', 'Sonnenlegion', 'Stahlfront', 'Eismeerkorps', 'Purpurgarde', 'Sturmlegion'] },
 };
+
+/** Verbandsfarben: 8 klar unterscheidbare Farbtöne für alle Spieler beider Parteien (jede Farbe nur einmal je Spiel).
+ *  [Farbe, CSS, Farbname]; FACTIONS[f].colors[i] = [Farbe, CSS, Verbandsname, Farbname] (Verbandsname je Partei) */
+export const COLORS = [
+  [0x2f6fff, '#3d7dff', 'Blau'], [0xe8322a, '#f0402f', 'Rot'], [0x2ec84a, '#38d457', 'Grün'], [0xf5d21e, '#f7da36', 'Gelb'],
+  [0xff8a14, '#ff9628', 'Orange'], [0x18d6e0, '#2ee0e8', 'Türkis'], [0x9b4dff, '#a862ff', 'Violett'], [0xff4fb8, '#ff62c2', 'Pink'],
+];
+for (const F of Object.values(FACTIONS)) F.colors = COLORS.map((c, i) => [c[0], c[1], F.units[i], c[2]]);
 
 export const TEAMS = [{}, {}, {}, {}];   // je Spieler (Index = Spieler-id), wird von setupTeams gefüllt
 
-/** Belegt TEAMS nach den Parteien der Spieler (factions[i] = 'allies' | 'axis'); Verbände derselben Partei bekommen verschiedene Farben.
- *  picks[i] = gewünschter Farbindex (Mensch, Auswahl im Menü); ohne Wunsch: zufällige noch freie Farbe der Partei. */
+/** Belegt TEAMS nach den Parteien der Spieler (factions[i] = 'allies' | 'axis'); jeder Spieler bekommt eine andere Farbe (COLORS).
+ *  picks[i] = gewünschter Farbindex (Menü/Lobby); ohne Wunsch: zufällige noch freie Farbe. */
 export function setupTeams(factions, picks = []) {
-  const used = { allies: new Set(), axis: new Set() };
-  factions.forEach((f, i) => { if (picks[i] != null) used[f].add(picks[i]); });
+  const used = new Set();
+  factions.forEach((f, i) => { if (picks[i] != null) used.add(picks[i]); });
   factions.forEach((f, i) => {
     const F = FACTIONS[f];
     let k = picks[i];
     if (k == null) {
-      const free = F.colors.map((_, j) => j).filter((j) => !used[f].has(j));
-      k = free.length ? free[Math.floor(Math.random() * free.length)] : i % F.colors.length;
-      used[f].add(k);
+      const free = COLORS.map((_, j) => j).filter((j) => !used.has(j));
+      k = free.length ? free[Math.floor(Math.random() * free.length)] : i % COLORS.length;
+      used.add(k);
     }
     const c = F.colors[k];
     TEAMS[i] = { name: F.name + ' – ' + c[2], short: F.name, color: c[0], css: c[1], paint: F.paint, olive: F.olive, gear: F.gear, cloth: F.cloth, uniform: F.uniform, camo: F.camo, pattern: F.pattern, faction: f };
@@ -66,16 +70,18 @@ export const WEAPONS = {
   sam:        { dmg: 80, rof: 2.8, proj: 'rocket', speed: 85, vs: { inf: 0.35, light: 0.8, heavy: 0.6, air: 1.3, building: 0.4 }, sound: 'rocket', aa: true, splash: 2, salvo: 2, aaPref: true },
 };
 
+// radius = halbe Breite (Kreis für Zielen/Auswahl); len = Rumpflänge in m, lenOff = Versatz der Rumpfmitte nach vorn:
+// Bodenfahrzeuge kollidieren als Kapsel (Strecke längs der Fahrtrichtung + radius), siehe game.js separate
 export const UNITS = {
   rifle:     { name: 'Schütze', desc: 'Infanterie mit Sturmgewehr. Stark gegen Infanterie.', cost: 120, time: 5, hp: 125, speed: 4.6, armor: 'inf', weapon: 'rifle', range: 22, sight: 30, from: 'barracks', model: 'rifleman', radius: 0.8, inf: true, key: 'inf' },
   rocket:    { name: 'Panzerjäger', desc: 'Raketen gegen Fahrzeuge und Luftziele.', cost: 300, time: 8, hp: 115, speed: 4.0, armor: 'inf', weapon: 'atrocket', range: 28, sight: 32, from: 'barracks', model: 'bazooka', radius: 0.8, inf: true, key: 'inf', launcher: true },
-  buggy:     { name: 'Wiesel', desc: 'Schneller Späh-Buggy mit schwerem Maschinengewehr. Stark gegen Infanterie, schwach gegen Panzer, große Sichtweite.', cost: 450, time: 7, hp: 300, speed: 15, turn: 3.4, armor: 'light', weapon: 'hmg', range: 26, sight: 44, from: 'factory', model: 'buggy', radius: 2.1, turretTurn: 7, wheels: true, key: 'veh' },
-  ifv:       { name: 'Schakal', desc: 'Schneller Schützenpanzer mit Maschinenkanone. Flugabwehrfähig.', cost: 650, time: 10, hp: 520, speed: 11, turn: 2.6, armor: 'light', weapon: 'autocannon', range: 28, sight: 38, from: 'factory', model: 'ifv', radius: 2.5, turretTurn: 4.5, key: 'veh' },
-  tank:      { name: 'Wolf', desc: 'Kampfpanzer. Schwer gepanzert, starke Kanone.', cost: 950, time: 14, hp: 1000, speed: 7.8, turn: 1.7, armor: 'heavy', weapon: 'cannon', range: 34, sight: 38, from: 'factory', model: 'tank', radius: 2.8, turretTurn: 2.2, key: 'veh' },
-  flak:      { name: 'Luchs', desc: 'Flugabwehrpanzer mit Zwillings-Maschinenkanone und Radar. Stark gegen Luftziele und Infanterie, schwach gegen Panzer.', cost: 850, time: 12, hp: 620, speed: 9, turn: 2.0, armor: 'light', weapon: 'flak', range: 36, sight: 44, from: 'factory', model: 'flak', radius: 2.8, turretTurn: 5, pitchAir: 0.5, key: 'veh' },
-  artillery: { name: 'Donner', desc: 'Panzerhaubitze mit großer Reichweite und Flächenschaden. Mindestdistanz.', cost: 1200, time: 16, hp: 420, speed: 8, turn: 1.6, armor: 'light', weapon: 'howitzer', range: 78, minRange: 16, sight: 36, from: 'factory', model: 'artillery', radius: 2.8, turretTurn: 1.3, req: ['radar'], key: 'veh' },
-  harvester: { name: 'Erzsammler', desc: 'Sammelt Erz und bringt es zur Raffinerie.', cost: 1400, time: 14, hp: 1100, speed: 7, turn: 1.5, armor: 'heavy', sight: 26, from: 'factory', model: 'harvester', radius: 3.0, cargo: 800, req: ['refinery'], key: 'veh' },
-  mcv:       { name: 'Mobile Basis', desc: 'Lässt sich zum Hauptquartier entfalten (D).', cost: 3000, time: 25, hp: 1600, speed: 5.5, turn: 1.1, armor: 'heavy', sight: 30, from: 'factory', model: 'mcv', radius: 3.4, req: ['radar'], key: 'veh' },
+  buggy:     { name: 'Wiesel', desc: 'Schneller Späh-Buggy mit schwerem Maschinengewehr. Stark gegen Infanterie, schwach gegen Panzer, große Sichtweite.', cost: 450, time: 7, hp: 300, speed: 15, turn: 3.4, armor: 'light', weapon: 'hmg', range: 26, sight: 44, from: 'factory', model: 'buggy', radius: 2.1, len: 5.6, turretTurn: 7, wheels: true, key: 'veh' },
+  ifv:       { name: 'Schakal', desc: 'Schneller Schützenpanzer mit Maschinenkanone. Flugabwehrfähig.', cost: 650, time: 10, hp: 520, speed: 11, turn: 2.6, armor: 'light', weapon: 'autocannon', range: 28, sight: 38, from: 'factory', model: 'ifv', radius: 2.5, len: 7.8, turretTurn: 4.5, key: 'veh' },
+  tank:      { name: 'Wolf', desc: 'Kampfpanzer. Schwer gepanzert, starke Kanone.', cost: 950, time: 14, hp: 1000, speed: 7.8, turn: 1.7, armor: 'heavy', weapon: 'cannon', range: 34, sight: 38, from: 'factory', model: 'tank', radius: 2.8, len: 9.0, turretTurn: 2.2, key: 'veh' },
+  flak:      { name: 'Luchs', desc: 'Flugabwehrpanzer mit Zwillings-Maschinenkanone und Radar. Stark gegen Luftziele und Infanterie, schwach gegen Panzer.', cost: 850, time: 12, hp: 620, speed: 9, turn: 2.0, armor: 'light', weapon: 'flak', range: 36, sight: 44, from: 'factory', model: 'flak', radius: 2.8, len: 8.3, turretTurn: 5, pitchAir: 0.5, key: 'veh' },
+  artillery: { name: 'Donner', desc: 'Panzerhaubitze mit großer Reichweite und Flächenschaden. Mindestdistanz.', cost: 1200, time: 16, hp: 420, speed: 8, turn: 1.6, armor: 'light', weapon: 'howitzer', range: 78, minRange: 16, sight: 36, from: 'factory', model: 'artillery', radius: 2.8, len: 7.2, turretTurn: 1.3, req: ['radar'], key: 'veh' },
+  harvester: { name: 'Erzsammler', desc: 'Sammelt Erz und bringt es zur Raffinerie.', cost: 1400, time: 14, hp: 1100, speed: 7, turn: 1.5, armor: 'heavy', sight: 26, from: 'factory', model: 'harvester', radius: 3.0, len: 9.6, lenOff: 0.85, cargo: 800, req: ['refinery'], key: 'veh' },
+  mcv:       { name: 'Mobile Basis', desc: 'Lässt sich zum Hauptquartier entfalten (D).', cost: 3000, time: 25, hp: 1600, speed: 5.5, turn: 1.1, armor: 'heavy', sight: 30, from: 'factory', model: 'mcv', radius: 3.4, len: 9.6, req: ['radar'], key: 'veh' },
   heli:      { name: 'Hornisse', desc: 'Kampfhubschrauber mit Panzerabwehrraketen. 3 je Flugfeld.', cost: 1500, time: 16, hp: 520, speed: 18, turn: 2.4, armor: 'air', weapon: 'hellfire', range: 32, sight: 44, from: 'helipad', model: 'heli', radius: 3.0, scale: 0.72, air: true, key: 'air' },
   jet:       { name: 'Falke', desc: 'Jagdbomber: parkt auf einem Flugfeld (3 je Flugfeld), startet auf Befehl, greift Bodenziele an und landet danach wieder.', scale: 0.6, cost: 1800, time: 18, hp: 420, speed: 38, turn: 1.5, armor: 'air', weapon: 'jetmissile', range: 34, sight: 46, from: 'helipad', model: 'jet', radius: 3.4, air: true, jet: true, alt: 24, req: ['radar'], key: 'air' },
 };

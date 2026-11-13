@@ -1,6 +1,6 @@
 // Prozeduraler Sound (WebAudio) + Sprachansagen (speechSynthesis, deutsch)
 let ctx = null, master = null, noiseBuf = null, comp = null;
-export const AUDIO = { enabled: true, volume: 0.7, listener: { x: 0, z: 0, zoom: 80 } };
+export const AUDIO = { enabled: true, volume: 0.7, listener: { x: 0, z: 0, zoom: 80 }, speech: true, sfx: 1 };   // speech/sfx: Menü-Gefecht im Hintergrund leise und ohne Ansagen
 
 export function initAudio() {
   if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
@@ -39,7 +39,7 @@ export function play(kind, x, z) {
   const now = ctx.currentTime;
   if (last[kind] && now - last[kind] < 0.045) return; // Drosselung
   last[kind] = now;
-  const vol = attenuation(x, z);
+  const vol = attenuation(x, z) * AUDIO.sfx;
   if (vol < 0.03) return;
   const out = ctx.createGain(); out.gain.value = vol;
   const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
@@ -95,7 +95,7 @@ function pickVoice() {
 if (typeof speechSynthesis !== 'undefined') { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
 
 export function say(text, cooldown = 4) {
-  if (!AUDIO.enabled || typeof speechSynthesis === 'undefined') return;
+  if (!AUDIO.enabled || !AUDIO.speech || typeof speechSynthesis === 'undefined') return;
   const now = performance.now() / 1000;
   if (lastSay[text] && now - lastSay[text] < cooldown) return;
   if (now - speaking < 0.9) return;

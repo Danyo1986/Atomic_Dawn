@@ -24,6 +24,7 @@ export class Input {
     this.app = app; this.dom = dom; this.camera = camera;
     this.target = new THREE.Vector3(160, 0, 160);
     this.dist = 95; this.distT = 95; this.yaw = 0; this.yawT = 0; this.pitch = 0.98;
+    this.rig = null;   // Kameraübersteuerung des Menü-Gefechts (nur bei app.state === 'menu', siehe update)
     this.keys = new Set();
     this.mouse = { x: 0, y: 0, in: false, down: null };
     this.box = null; this.hover = null; this.mode = null; // 'place' | 'sell' | 'repair' | 'attackMove'
@@ -84,6 +85,17 @@ export class Input {
     const cam = this.camera;
     cam.position.set(this.target.x + Math.sin(this.yaw) * Math.cos(pitch) * this.dist, this.target.y + Math.sin(pitch) * this.dist, this.target.z + Math.cos(this.yaw) * Math.cos(pitch) * this.dist);
     cam.lookAt(this.target);
+    // Kinokamera des Menü-Gefechts (js/demo.js setzt this.rig = { pos, look, roll, fov, shift }): übersteuert Position und
+    // Blick nur, solange das Menü läuft; im Spiel gilt immer die normale Kamera (Bildwinkel wird zurückgestellt)
+    const rig = this.app.state === 'menu' && this.rig;
+    if (rig) {
+      if (this.fov0 == null) this.fov0 = cam.fov;
+      const fov = rig.fov || this.fov0;
+      if (cam.fov !== fov) { cam.fov = fov; cam.updateProjectionMatrix(); }
+      cam.position.copy(rig.pos); cam.lookAt(rig.look);
+      if (rig.shift) cam.rotateY(Math.atan(Math.tan(cam.fov * Math.PI / 360) * cam.aspect * rig.shift));   // Motiv nach rechts ins freie Bildfeld
+      if (rig.roll) cam.rotateZ(rig.roll);
+    } else if (this.fov0 != null) { cam.fov = this.fov0; this.fov0 = null; cam.updateProjectionMatrix(); }
     const fx = this.game && this.game.fx;
     if (fx) { // Erschütterung durch nahe Explosionen
       fx.view.x = this.target.x; fx.view.z = this.target.z; fx.view.dist = this.dist;
@@ -150,7 +162,7 @@ export class Input {
     const g = this.ground(sx, sy);
     if (!g) return null;
     const b = game.buildingAtCell(Math.floor(g.x / CELL), Math.floor(g.z / CELL));
-    if (b && (b.owner === 0 || b.seen || !FOG.enabled)) return b;
+    if (b && (game.friendly(b) || b.seen || !FOG.enabled)) return b;
     return null;
   }
 
@@ -162,13 +174,13 @@ export class Input {
     this.dom.style.cursor = this.cursorFor();
   }
   cursorFor() {
-    const game = this.game, h = this.hover, sel = [...game.selection].filter((e) => e.owner === 0);
+    const game = this.game, h = this.hover, sel = [...game.selection].filter((e) => game.mine(e));
     if (this.mode === 'place') return 'default';
-    if (this.mode === 'sell') return h && h.kind === 'building' && h.owner === 0 ? CUR.sell : CUR.deny;
-    if (this.mode === 'repair') return h && h.kind === 'building' && h.owner === 0 && h.hp < h.maxHp ? CUR.repair : CUR.deny;
+    if (this.mode === 'sell') return h && h.kind === 'building' && game.mine(h) ? CUR.sell : CUR.deny;
+    if (this.mode === 'repair') return h && h.kind === 'building' && game.mine(h) && h.hp < h.maxHp ? CUR.repair : CUR.deny;
     if (this.mode === 'attackMove' || this.mode === 'nuke') return CUR.attack;
-    if (h && h.owner !== 0 && sel.some((u) => u.kind === 'unit' && u.def.weapon && game.canHit(u, h))) return CUR.attack;
-    if (h && h.owner === 0) { if (sel.length === 1 && h === sel[0] && h.type === 'mcv') return CUR.deploy; return CUR.select; }
+    if (h && !game.friendly(h) && sel.some((u) => u.kind === 'unit' && u.def.weapon && game.canHit(u, h))) return CUR.attack;
+    if (h && game.friendly(h)) { if (sel.length === 1 && h === sel[0] && h.type === 'mcv') return CUR.deploy; return CUR.select; }
     const units = sel.filter((u) => u.kind === 'unit');
     if (units.length) {
       const g = this.ground(this.mouse.x, this.mouse.y);
@@ -265,7 +277,7 @@ export class Input {
         if (n) this.setWallRot(Math.abs(dz) > Math.abs(dx) ? 1 : 0);
         for (let i = this.lastWallC ? 1 : 0; i <= n; i++) {
           const x = L[0] + Math.round(dx * i / (n || 1)), z = L[1] + Math.round(dz * i / (n || 1));
-          this.game.placeWall(this.game.human, x, z, this.wallRot || 0);
+          this.app.cmd({ op: 'wall', cx: x, cz: z, rot: this.wallRot || 0 });
         }
         this.lastWall = c.join(); this.lastWallC = c;
       }
@@ -292,32 +304,34 @@ export class Input {
     const game = this.game;
     if (this.mode === 'place') {
       const c = this.ghostCell();
-      if (this.placeType === 'wall') { if (c && c.join() !== this.lastWall && !game.placeWall(game.human, c[0], c[1], this.wallRot || 0)) play('deny'); this.lastWall = null; this.lastWallC = null; return; }
-      if (c && game.placeReady(game.human, this.placeType, c[0], c[1])) { this.clearGhost(); this.setMode(null); }
+      if (this.placeType === 'wall') { if (c && c.join() !== this.lastWall && this.app.cmd({ op: 'wall', cx: c[0], cz: c[1], rot: this.wallRot || 0 }) === false) play('deny'); this.lastWall = null; this.lastWallC = null; return; }
+      // Mehrspieler: Befehl wirkt erst im nächsten Takt – hier vorab prüfen, ob es passt
+      const q = c && game.human.queues[BUILDINGS[this.placeType].key];
+      if (c && q.ready && q.type === this.placeType && game.canPlace(game.human, this.placeType, c[0], c[1]) && this.app.cmd({ op: 'place', type: this.placeType, cx: c[0], cz: c[1] }) !== false) { this.clearGhost(); this.setMode(null); }
       else play('deny');
       return;
     }
     const h = this.pick(e.clientX, e.clientY);
-    if (this.mode === 'sell') { if (h && h.kind === 'building' && h.owner === 0) { game.sell(h); } else play('deny'); if (!e.shiftKey) this.setMode(null); return; }
-    if (this.mode === 'repair') { if (h && h.kind === 'building' && h.owner === 0 && h.hp < h.maxHp) { h.repairing = !h.repairing; play('click'); } else play('deny'); if (!e.shiftKey) this.setMode(null); return; }
+    if (this.mode === 'sell') { if (h && h.kind === 'building' && game.mine(h)) { this.app.cmd({ op: 'sell', id: h.id }); } else play('deny'); if (!e.shiftKey) this.setMode(null); return; }
+    if (this.mode === 'repair') { if (h && h.kind === 'building' && game.mine(h) && h.hp < h.maxHp) { this.app.cmd({ op: 'repair', id: h.id }); play('click'); } else play('deny'); if (!e.shiftKey) this.setMode(null); return; }
     if (this.mode === 'nuke') {
       const g = this.ground(e.clientX, e.clientY), s = game.readySilo(game.human);
-      if (g && s && game.launchNuke(s, g.x, g.z)) this.app.ui.addMarker(g.x, g.z, '#ff3a2a'); else play('deny');
+      if (g && s && this.app.cmd({ op: 'nuke', x: g.x, z: g.z }) !== false) this.app.ui.addMarker(g.x, g.z, '#ff3a2a'); else play('deny');
       this.setMode(null);
       return;
     }
     if (this.mode === 'attackMove') {
       const units = this.myUnits();
-      if (h && h.owner !== 0) game.cmdAttack(units, h);
-      else { const g = this.ground(e.clientX, e.clientY); if (g) { game.cmdMove(units, g.x, g.z, true); this.app.ui.addMarker(g.x, g.z, '#ff6a4a'); } }
+      if (h && !game.friendly(h)) this.order({ op: 'attack', ids: units.map((u) => u.id), t: h.id });
+      else { const g = this.ground(e.clientX, e.clientY); if (g) { this.order({ op: 'move', ids: units.map((u) => u.id), x: g.x, z: g.z, am: 1 }); this.app.ui.addMarker(g.x, g.z, '#ff6a4a'); } }
       this.setMode(null);
       return;
     }
     const now = performance.now();
-    if (h && h.owner === 0 && h.kind === 'unit') {
+    if (h && game.mine(h) && h.kind === 'unit') {
       if (now - this.lastClick.t < 350 && this.lastClick.id === h.type) { this.selectSameOnScreen(h.type, e.shiftKey); this.lastClick.t = 0; return; }
       this.lastClick = { t: now, id: h.type };
-      if (game.selection.size === 1 && game.selection.has(h) && h.type === 'mcv') { game.cmdDeploy(h); return; }
+      if (game.selection.size === 1 && game.selection.has(h) && h.type === 'mcv') { this.app.cmd({ op: 'deploy', id: h.id }); return; }
       if (e.shiftKey) { if (game.selection.has(h)) game.selection.delete(h); else game.selection.add(h); }
       else { game.selection.clear(); game.selection.add(h); }
       play('select');
@@ -332,14 +346,14 @@ export class Input {
     const g = this.ground(e.clientX, e.clientY);
     const h = this.pick(e.clientX, e.clientY);
     const sel = [...game.selection];
-    if (sel.length === 1 && sel[0].kind === 'building' && sel[0].owner === 0) {
-      if (g) { sel[0].rally = { x: g.x, z: g.z }; play('click'); this.app.ui.addMarker(g.x, g.z, '#7dff9a'); }
+    if (sel.length === 1 && sel[0].kind === 'building' && game.mine(sel[0])) {
+      if (g) { this.app.cmd({ op: 'rally', id: sel[0].id, x: g.x, z: g.z }); play('click'); this.app.ui.addMarker(g.x, g.z, '#7dff9a'); }
       return;
     }
-    if (h && h.owner !== 0) { const u = this.myUnits(); if (u.length) { game.cmdAttack(u, h); this.app.ui.addMarker(h.x, h.z, '#ff4a3a'); } return; }
-    if (h && h.owner === 0 && h.type === 'refinery') {
+    if (h && !game.friendly(h)) { const u = this.myUnits(); if (u.length) { this.order({ op: 'attack', ids: u.map((x) => x.id), t: h.id }); this.app.ui.addMarker(h.x, h.z, '#ff4a3a'); } return; }
+    if (h && game.mine(h) && h.type === 'refinery') {
       const hv = this.myUnits().filter((u) => u.def.cargo);
-      if (hv.length) { for (const u of hv) { u.hState = 'toDock'; u.order = null; u.path = []; } play('order'); return; }
+      if (hv.length) { this.order({ op: 'dock', ids: hv.map((u) => u.id) }); if (!game.net) play('order'); return; }
     }
     if (g) this.commandAt(g.x, g.z);
   }
@@ -349,19 +363,22 @@ export class Input {
     if (!units.length) return;
     const k = Math.floor(z / CELL) * MAPN + Math.floor(x / CELL);
     const harv = units.filter((u) => u.def.cargo), rest = units.filter((u) => !u.def.cargo);
-    if (harv.length && game.terrain.ore[k] > 20) { game.cmdHarvest(harv, x, z); this.app.ui.addMarker(x, z, '#ffc94a'); if (rest.length) game.cmdMove(rest, x, z); return; }
-    game.cmdMove(units, x, z);
+    const ids = (l) => l.map((u) => u.id);
+    if (harv.length && game.terrain.ore[k] > 20) { this.order({ op: 'harvest', ids: ids(harv), x, z }); this.app.ui.addMarker(x, z, '#ffc94a'); if (rest.length) this.order({ op: 'move', ids: ids(rest), x, z }); return; }
+    this.order({ op: 'move', ids: ids(units), x, z });
     this.app.ui.addMarker(x, z, '#7dff9a');
   }
 
-  myUnits() { return [...this.game.selection].filter((e) => e.kind === 'unit' && e.owner === 0 && !e.dead); }
+  myUnits() { return [...this.game.selection].filter((e) => e.kind === 'unit' && this.game.mine(e) && !e.dead); }
+  /** Einheitenbefehl senden; im Mehrspieler sofort hörbare Rückmeldung (ausgeführt wird erst im nächsten Takt) */
+  order(c) { this.app.cmd(c); if (this.game.net) play('order'); }
 
   boxSelect(add) {
     const game = this.game, b = this.box, r = this.dom.getBoundingClientRect();
     if (!add) game.selection.clear();
     let any = false;
     for (const u of game.units) {
-      if (u.owner !== 0 || u.dead || u.dying !== undefined) continue;
+      if (!game.mine(u) || u.dead || u.dying !== undefined) continue;
       const p = this.screenOf(u.x, u.y + 1, u.z);
       const x = p.x - r.left, y = p.y - r.top;
       if (x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1) { game.selection.add(u); any = true; }
@@ -375,7 +392,7 @@ export class Input {
     const game = this.game, r = this.dom.getBoundingClientRect();
     if (!add) game.selection.clear();
     for (const u of game.units) {
-      if (u.owner !== 0 || u.type !== type || u.dead) continue;
+      if (!game.mine(u) || u.type !== type || u.dead) continue;
       const p = this.screenOf(u.x, u.y, u.z);
       if (p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom) game.selection.add(u);
     }
@@ -384,7 +401,11 @@ export class Input {
 
   // ------------------------------------------------------------- Tastatur
   onKey(e, down) {
-    if (e.target && e.target.tagName === 'SELECT') return;
+    // Eingabefelder (Chat, Menü) behalten ihre Tasten – aber nur, solange sie sichtbar sind: ein im ausgeblendeten Menü
+    // fokussiertes Auswahlfeld darf im Spiel keine Tasten schlucken (sonst gingen z. B. Strg+1–9 ins Leere)
+    const tg = e.target, field = tg && /^(SELECT|INPUT|TEXTAREA)$/.test(tg.tagName);
+    if (field && tg.offsetParent !== null && tg.type !== 'range') return;
+    if (field && this.app.state === 'game') tg.blur();
     if (down) this.keys.add(e.code); else this.keys.delete(e.code);
     if (!down || this.app.state !== 'game') return;
     initAudio();
@@ -396,14 +417,19 @@ export class Input {
     }
     if (this.app.paused) return;
     const units = this.myUnits();
-    const digit = e.code.startsWith('Digit') ? e.code.slice(5) : null;
-    if (digit && digit !== '0') {
-      if (e.ctrlKey) {
+    // Ziffern der oberen Reihe und des Nummernblocks
+    const digit = /^(Digit|Numpad)[1-9]$/.test(e.code) ? e.code.slice(-1) : null;
+    if (digit) {
+      if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
+        if (!units.length) { this.app.ui.message('Gruppe ' + digit + ': erst Einheiten auswählen, dann Strg+' + digit + '.'); play('deny'); return; }
         for (const u of game.units) if (u.group === digit) u.group = null;
         this.groups[digit] = units.map((u) => u.id);
+        // eine Einheit gehört nur zu einer Gruppe: aus ihrer bisherigen Gruppe austragen (leere Gruppen entfallen)
+        const moved = new Set(this.groups[digit]);
+        for (const k of Object.keys(this.groups)) if (k !== digit) { this.groups[k] = this.groups[k].filter((id) => !moved.has(id)); if (!this.groups[k].length) delete this.groups[k]; }
         for (const u of units) u.group = digit;
-        play('click');
+        play('click'); this.app.ui.message(`Gruppe ${digit} festgelegt: ${units.length} Einheit${units.length > 1 ? 'en' : ''} – Taste ${digit} wählt sie, zweimal springt hin.`, false, 'grp');
       } else if (this.groups[digit]) {
         const list = this.groups[digit].map((id) => game.byId.get(id)).filter((u) => u && !u.dead);
         if (!list.length) return;
@@ -415,10 +441,10 @@ export class Input {
       return;
     }
     switch (e.code) {
-      case 'KeyS': if (units.length) { game.cmdStop(units); play('click'); } break;
+      case 'KeyS': if (units.length) { this.app.cmd({ op: 'stop', ids: units.map((u) => u.id) }); play('click'); } break;
       case 'KeyA': if (units.length) this.setMode('attackMove'); break;
-      case 'KeyD': { const m = units.find((u) => u.type === 'mcv'); if (m) game.cmdDeploy(m); break; }
-      case 'KeyH': { const hq = game.buildings.find((b) => b.owner === 0 && b.type === 'hq') || game.buildings.find((b) => b.owner === 0) || game.units.find((u) => u.owner === 0); if (hq) this.lookAt(hq.x, hq.z); break; }
+      case 'KeyD': { const m = units.find((u) => u.type === 'mcv'); if (m) this.app.cmd({ op: 'deploy', id: m.id }); break; }
+      case 'KeyH': { const hq = game.buildings.find((b) => game.mine(b) && b.type === 'hq') || game.buildings.find((b) => game.mine(b)) || game.units.find((u) => game.mine(u)); if (hq) this.lookAt(hq.x, hq.z); break; }
       case 'KeyR': if (this.mode === 'place' && this.placeType === 'wall') { this.setWallRot(this.wallRot ? 0 : 1); play('click'); break; }   // Mauer drehen
         this.setMode(this.mode === 'repair' ? null : 'repair'); break;
       case 'KeyV': this.setMode(this.mode === 'sell' ? null : 'sell'); break;

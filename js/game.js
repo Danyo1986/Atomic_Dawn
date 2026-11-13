@@ -4,14 +4,50 @@ import { CELL, MAPN, WORLD, UNITS, BUILDINGS, WEAPONS, TEAMS, DIFFICULTY, AIRFIE
 import { clamp, angDiff, turnTo, dist, dist2 } from './util.js';
 import { instantiate, attachInfantryWeapon, BLINK } from './assets.js';
 import { findPath, nearestFree } from './path.js';
-import { FOG, updateFog, isVisible, isExplored } from './fog.js';
+import { FOG, updateFog, visGrid, isVisible, isExplored } from './fog.js';
 import { play, say } from './audio.js';
+import { rand } from './rng.js';
 
 const INF_SCALE = 1.45;
 const AIR_ALT = 15;
 const UP = new THREE.Vector3(0, 1, 0);
 const _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _n = new THREE.Vector3();
-const _nearA = [], _nearB = [], _box = new THREE.Box3();
+const _nearA = [], _nearB = [], _nearC = [], _box = new THREE.Box3();
+
+// ---- Körperform der Bodeneinheiten: Kapsel = Strecke längs der Fahrtrichtung (halbe Länge segA) + Radius
+const segA = (d) => d._segA ?? (d._segA = d.inf || !d.len ? 0 : Math.max(0, d.len / 2 - d.radius));
+const reachOf = (d) => d._reach ?? (d._reach = segA(d) + Math.abs(d.lenOff || 0) + d.radius);   // größte Ausdehnung um den Mittelpunkt
+const MAX_REACH = Math.max(...Object.values(UNITS).filter((d) => !d.air).map(reachOf));
+const SEP_GAP = 0.4, SEP_SLOP = 0.03;                                     // Luft zwischen Fahrzeugen / Toleranz gegen Zittern
+const _sA = [0, 0, 0, 0], _sB = [0, 0, 0, 0], _cp = [0, 0, 0, 0];
+/** Gewicht beim Auseinanderschieben: Infanterie leicht, große Fahrzeuge schwer, stehende Einheiten dreifach */
+const heft = (u) => (u.def.inf ? 0.12 : u.def.radius ** 2 * (1 + segA(u.def) * 0.5)) * (u.path.length || u.speed > 0.5 ? 1 : 3);
+/** Kapselstrecke einer Einheit nach out = [x0, z0, x1, z1] */
+function bodySeg(u, out) {
+  const d = u.def, a = segA(d), c = Math.cos(u.heading), s = Math.sin(u.heading), o = d.lenOff || 0;
+  const mx = u.x + c * o, mz = u.z + s * o;
+  out[0] = mx - c * a; out[1] = mz - s * a; out[2] = mx + c * a; out[3] = mz + s * a;
+  return out;
+}
+/** nächste Punkte zweier Strecken p, q -> out = [px, pz, qx, qz] */
+function closestSeg(p, q, out) {
+  const d1x = p[2] - p[0], d1z = p[3] - p[1], d2x = q[2] - q[0], d2z = q[3] - q[1], rx = p[0] - q[0], rz = p[1] - q[1];
+  const a = d1x * d1x + d1z * d1z, e = d2x * d2x + d2z * d2z, f = d2x * rx + d2z * rz;
+  let s = 0, t = 0;
+  if (a < 1e-9) t = e < 1e-9 ? 0 : clamp(f / e, 0, 1);
+  else {
+    const c = d1x * rx + d1z * rz;
+    if (e < 1e-9) s = clamp(-c / a, 0, 1);
+    else {
+      const b = d1x * d2x + d1z * d2z, den = a * e - b * b;
+      s = den > 1e-9 ? clamp((b * f - c * e) / den, 0, 1) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = clamp(-c / a, 0, 1); } else if (t > 1) { t = 1; s = clamp((b - c) / a, 0, 1); }
+    }
+  }
+  out[0] = p[0] + d1x * s; out[1] = p[1] + d1z * s; out[2] = q[0] + d2x * t; out[3] = q[1] + d2z * t;
+  return out;
+}
 const _ray = new THREE.Raycaster(), DOWN = new THREE.Vector3(0, -1, 0);
 
 let NEXT_ID = 1;
@@ -30,16 +66,21 @@ export class Game {
     this.events = []; // UI-Meldungen
     this.over = null;
     this.players = [];
-    const n = opts.players;
-    for (let i = 0; i < n; i++) {
+    // Plätze: opts.slots[i] = { human, ally, diff, name } (Mehrspieler-Lobby); ohne: Spieler 0 = Mensch, alle anderen KI, jeder gegen jeden
+    const slots = opts.slots || Array.from({ length: opts.players }, (_, i) => ({ human: i === 0, ally: i, diff: opts.difficulty }));
+    slots.forEach((s, i) => {
       this.players.push({
-        id: i, team: i, human: i === 0, credits: opts.credits, power: { prod: 0, use: 0 }, low: false,
+        id: i, team: i, ally: s.ally ?? i, human: !!s.human, name: s.name || '', credits: opts.credits, power: { prod: 0, use: 0 }, low: false,
         queues: { bld: mkQ(), def: mkQ(), inf: mkQ(), veh: mkQ(), air: mkQ() },
-        count: {}, alive: true, diff: i === 0 ? null : DIFFICULTY[opts.difficulty],
+        count: {}, alive: true, diff: s.human ? null : DIFFICULTY[s.diff || opts.difficulty || 'normal'],
         stats: { built: 0, lost: 0, kills: 0, bBuilt: 0, bLost: 0, ore: 0 },
       });
-    }
-    this.human = this.players[0];
+    });
+    this.net = !!opts.net;          // Mehrspieler (Lockstep): keine Zeitlupe am Ende, Sicht je Team in der Simulation
+    this.fogOn = opts.fog !== false; // Kriegsnebel gilt für alle gleich (Lobby-Einstellung)
+    this.me = opts.me || 0;          // Index des Spielers an diesem Rechner
+    this.human = this.players[this.me];   // = lokaler Spieler (Meldungen, Oberfläche, Sicht); p === this.human = von einem Menschen gesteuert
+    this.allyVis = new Map();        // Sicht je Team (Simulation: menschliche Truppen greifen nur Gesehenes an)
     this.fogTimer = 0; this.oreTimer = 0; this.checkTimer = 0; this.fxTimer = 0;
     this.timers = []; this.anims = [];   // Zeitplan und laufende Abläufe im Spieltakt (pausieren mit, unabhängig von der Bildrate)
   }
@@ -55,11 +96,12 @@ export class Game {
     obj.add(nodes.root);
     const u = {
       id: NEXT_ID++, kind: 'unit', type, def, owner, x, z, y: 0, heading, speed: 0, hp: def.hp, maxHp: def.hp,
-      obj, nodes, path: [], order: null, target: null, cooldown: Math.random() * 0.5, turretYaw: 0, gunPitch: 0,
-      guard: { x, z }, stuck: 0, lastD: 1e9, repath: 0, cargo: 0, hState: def.cargo ? 'toOre' : null, acquireT: Math.random() * 0.5,
+      obj, nodes, path: [], order: null, target: null, cooldown: rand() * 0.5, turretYaw: 0, gunPitch: 0,
+      guard: { x, z }, stuck: 0, lastD: 1e9, repath: 0, cargo: 0, hState: def.cargo ? 'toOre' : null, acquireT: rand() * 0.5,
       salvo: 0, salvoT: 0, alt: def.air ? (def.alt || AIR_ALT) : 0, dead: false, lastHit: -99, vis: true,
     };
     if (def.inf) {
+      if (nodes.phase) nodes.phase(rand() * 6, rand() * 9);   // Gangphase aus dem Simulationszufall (bestimmt die Mündungslage)
       nodes.root.scale.setScalar(INF_SCALE);
       if (!nodes.figure) attachInfantryWeapon(nodes, def.launcher, owner);
       nodes.actions.idle.play();
@@ -97,7 +139,7 @@ export class Game {
     const b = {
       id: NEXT_ID++, kind: 'building', type, def, owner, cx, cz, w: def.w, h: def.h, x: c.x, z: c.z, y: hh,
       hp: def.hp, maxHp: def.hp, obj, nodes, rise: instant ? 1 : 0, dead: false, lastHit: -99, repairing: false, selling: 0,
-      cooldown: 0, target: null, turretYaw: -Math.PI / 2, acquireT: 0, dockUser: 0, fxT: Math.random(), seen: owner === 0,
+      cooldown: 0, target: null, turretYaw: -Math.PI / 2, acquireT: 0, dockUser: 0, fxT: Math.random(), seen: false,
       baseY: hh - 0.05, top: Math.max(1.5, top),
     };
     if (!instant) obj.position.y = b.baseY - b.top;
@@ -122,7 +164,20 @@ export class Game {
   }
 
   // ================================================================= Abfragen
-  isEnemy(a, b) { return a.owner !== b.owner; }
+  isEnemy(a, b) { return !this.allied(a.owner, b.owner); }
+  /** Spieler-ids im selben Team (oder derselbe Spieler) */
+  allied(a, b) { return a === b || (this.players[a] && this.players[b] && this.players[a].ally === this.players[b].ally); }
+  /** gehört zum Team des Spielers an diesem Rechner (eigene Sicht, Auswahl verbündeter Gebäude im Nebel) */
+  mine(o) { return o.owner === this.me; }
+  friendly(o) { return this.allied(o.owner, this.me); }
+  /** Sieht das Team von Spieler pid den Punkt? Deterministisch (Simulationstakt), unabhängig vom Rechner */
+  seenBy(pid, x, z) {
+    if (!this.fogOn) return true;
+    const g = this.allyVis.get(this.players[pid].ally);
+    if (!g) return true;
+    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
+    return cx >= 0 && cz >= 0 && cx < MAPN && cz < MAPN && g[cz * MAPN + cx] === 1;
+  }
   rebuildHash() {
     this.hash.clear();
     for (const u of this.units) {
@@ -204,7 +259,7 @@ export class Game {
     }
     const wasLow = p.low;
     p.power.prod = Math.round(prod); p.power.use = use; p.low = use > prod;
-    if (p.human && p.low && !wasLow) say('Geringe Energie');
+    if (p === this.human && p.low && !wasLow) say('Geringe Energie');
   }
 
   orientWall(b) {
@@ -234,12 +289,12 @@ export class Game {
       if (q.list.length >= 10) return false;
       if (d.air) { // Flottengröße: 3 Jagdbomber + 3 Hubschrauber je Flugfeld
         const c = this.airCapacity(p, type);
-        if (c.used + c.queued >= c.cap) { if (p.human) say('Flugfelder voll belegt', 8); return false; }
+        if (c.used + c.queued >= c.cap) { if (p === this.human) say('Flugfelder voll belegt', 8); return false; }
       }
       q.list.push(type);
       if (!q.type) { q.type = q.list[0]; q.progress = 0; q.spent = 0; }
     }
-    if (p.human) { play('build'); if (BUILDINGS[type]) say('Bauvorgang'); else say('Ausbildung', 6); }
+    if (p === this.human) { play('build'); if (BUILDINGS[type]) say('Bauvorgang'); else say('Ausbildung', 6); }
     return true;
   }
   cancelItem(p, type) {
@@ -255,7 +310,7 @@ export class Game {
       q.list.splice(i, 1);
       q.type = q.list[0] || null;
     }
-    if (p.human) play('click');
+    if (p === this.human) play('click');
   }
 
   tickProduction(p, dt) {
@@ -276,12 +331,12 @@ export class Game {
       const dp = dt / d.time * mult;
       const want = Math.min(1, q.progress + dp);
       const need = d.cost * want - q.spent;
-      if (need > p.credits) { if (p.human && p.credits < 5) say('Unzureichende Mittel', 12); continue; }
+      if (need > p.credits) { if (p === this.human && p.credits < 5) say('Unzureichende Mittel', 12); continue; }
       p.credits -= need; q.spent += need; q.progress = want;
       if (q.progress >= 1) {
         if (BUILDINGS[q.type]) {
           q.ready = true;
-          if (p.human) { say('Bau abgeschlossen'); play('ready'); }
+          if (p === this.human) { say('Bau abgeschlossen'); play('ready'); }
         } else {
           const ok = this.deliverUnit(p, q.type);
           if (ok) { q.list.shift(); q.type = q.list[0] || null; q.progress = 0; q.spent = 0; }
@@ -297,32 +352,46 @@ export class Game {
     if (!prods.length) return false;
     if (d.jet) { // Jagdbomber brauchen einen freien Stellplatz; sonst wartet die Produktion
       const pad = this.freePad(p, true);
-      if (!pad) { if (p.human) say('Kein freies Flugfeld', 20); return false; }
+      if (!pad) { if (p === this.human) say('Kein freies Flugfeld', 20); return false; }
       const slot = this.freeSlot(pad), pp = this.padPos(pad, slot);
       const j = this.spawnUnit(type, p.id, pp.x, pp.z, -Math.PI / 2);
       j.pad = pad.id; j.slot = slot; j.jetState = 'parked'; j.alt = 0;
-      if (p.human) say('Jagdbomber bereit', 3);
+      if (p === this.human) say('Jagdbomber bereit', 3);
       return true;
     }
     let b = prods.find((x) => x.primary) || prods[0];
     if (d.air) { // Hubschrauber gehören zu einem Flugfeld mit freiem Platz und erscheinen dort
       b = this.freePad(p, false);
-      if (!b) { if (p.human) say('Kein freies Flugfeld', 20); return false; }
+      if (!b) { if (p === this.human) say('Kein freies Flugfeld', 20); return false; }
     }
     const ex = new THREE.Vector3();
     (b.nodes.exit || b.obj).getWorldPosition(ex);
     if (!b.nodes.exit) ex.set(b.x + b.w * CELL / 2, 0, b.z);
+    let ox = ex.x - b.x, oz = ex.z - b.z; const ol = Math.hypot(ox, oz) || 1; ox /= ol; oz /= ol;
+    if (!d.air && !d.inf) { // Ausgang noch von einem Fahrzeug belegt: kurz warten (höchstens 3 s) und Wartende bitten, Platz zu machen
+      const probe = { def: d, x: ex.x, z: ex.z, heading: Math.atan2(oz, ox) };
+      bodySeg(probe, _sA);
+      let busy = false;
+      for (const v of this.unitsNear(ex.x, ex.z, reachOf(d) + MAX_REACH + 1, _nearC)) {
+        if (v.def.air || v.def.inf || v.dying !== undefined) continue;
+        const c = closestSeg(_sA, bodySeg(v, _sB), _cp);
+        if (Math.hypot(c[2] - c[0], c[3] - c[1]) >= d.radius + v.def.radius) continue;
+        busy = true;
+        if (v.owner === p.id) this.makeWay(v, probe, ox, oz, (v.z - ex.z) * ox - (v.x - ex.x) * oz, true);
+      }
+      if (busy && this.time - (b.exitWait || (b.exitWait = this.time)) < 3) return false;
+      b.exitWait = 0;
+    }
     const u = this.spawnUnit(type, p.id, ex.x, ex.z, 0);
     if (d.air) { u.alt = 1; u.pad = b.id; }
     if (b.obj.visible && !d.inf) for (let i = 0; i < 4; i++) this.fx.dust(ex.x, b.y, ex.z, 1.3);
     // Sammelpunkt
-    let ox = ex.x - b.x, oz = ex.z - b.z; const ol = Math.hypot(ox, oz) || 1; ox /= ol; oz /= ol;
-    const rx = b.rally ? b.rally.x : ex.x + ox * (d.air ? 14 : 9) - oz * (Math.random() - 0.5) * 10;
-    const rz = b.rally ? b.rally.z : ex.z + oz * (d.air ? 14 : 9) + ox * (Math.random() - 0.5) * 10;
+    const rx = b.rally ? b.rally.x : ex.x + ox * (d.air ? 14 : 9) - oz * (rand() - 0.5) * 10;
+    const rz = b.rally ? b.rally.z : ex.z + oz * (d.air ? 14 : 9) + ox * (rand() - 0.5) * 10;
     u.heading = Math.atan2(oz, ox);
     if (type === 'harvester') { u.hState = 'toOre'; }
     else this.cmdMove([u], rx, rz, false, true);
-    if (p.human) say(d.inf ? 'Einheit bereit' : d.jet ? 'Jagdbomber bereit' : d.air ? 'Hubschrauber bereit' : 'Fahrzeug bereit', 3);
+    if (p === this.human) say(d.inf ? 'Einheit bereit' : d.jet ? 'Jagdbomber bereit' : d.air ? 'Hubschrauber bereit' : 'Fahrzeug bereit', 3);
     return true;
   }
 
@@ -346,30 +415,56 @@ export class Game {
     const start = nearestFree(tcx, tcz, ok, 15);
     if (start) [tcx, tcz] = start;
     ground.sort((a, b) => dist2(a.x, a.z, x, z) - dist2(b.x, b.z, x, z));
-    const used = new Map();
-    let ring = 0, cand = [];
-    const nextCell = (inf) => {
-      for (;;) {
-        if (!cand.length) {
-          for (let dz = -ring; dz <= ring; dz++) for (let dx = -ring; dx <= ring; dx++) if (Math.max(Math.abs(dx), Math.abs(dz)) === ring) cand.push([tcx + dx, tcz + dz]);
-          cand.sort((a, b) => ((a[0] - tcx) ** 2 + (a[1] - tcz) ** 2) - ((b[0] - tcx) ** 2 + (b[1] - tcz) ** 2));
-          ring++;
+    // Fahrtrichtung der Gruppe: Zielpunkte längs davon nach Fahrzeuglänge, quer nach Breite auseinander
+    let gx0 = 0, gz0 = 0;
+    for (const u of ground) { gx0 += u.x; gz0 += u.z; }
+    let fx = x - gx0 / (ground.length || 1), fz = z - gz0 / (ground.length || 1);
+    const fl = Math.hypot(fx, fz);
+    if (fl > 0.5) { fx /= fl; fz /= fl; } else { fx = 1; fz = 0; }
+    const placed = [];   // vergebene Zielpunkte [x, z, halbe Länge, halbe Breite, Infanterie]
+    const fits = (cx, cz, hl, hw, inf) => {
+      const px = (cx + 0.5) * CELL, pz = (cz + 0.5) * CELL;
+      for (const q of placed) {
+        if (inf && q[4]) continue;                     // Infanterie untereinander: bis zu 3 je Zelle
+        const dx = q[0] - px, dz = q[1] - pz, gap = (inf || q[4] ? 0.3 + 1.7 : 0.6);   // 1,7 m = Streuung der Infanterie
+        const lp = (dx * fx + dz * fz) / (hl + q[2] + gap), lq = (dz * fx - dx * fz) / (hw + q[3] + gap);
+        if (lp * lp + lq * lq < 1) return false;
+      }
+      placed.push([px, pz, hl, hw, inf]);
+      return true;
+    };
+    const halfLen = (d) => d.inf ? 0.8 : (d.len || d.radius * 2) / 2 + Math.abs(d.lenOff || 0);
+    // dort stehende Einheiten und Zielpunkte laufender Fahrbefehle sind belegt (z. B. mehrere Fahrzeuge nacheinander zum selben Sammelpunkt)
+    const mine = new Set(ground);
+    for (const v of this.units) {
+      if (v.dead || v.dying !== undefined || v.def.air || mine.has(v)) continue;
+      const mv = v.order && (v.order.type === 'move' || v.order.type === 'attackMove');
+      if (v.path.length && !mv) continue;
+      const p = v.path.length ? v.path[v.path.length - 1] : v;
+      if (dist2(p.x, p.z, x, z) > 45 * 45) continue;
+      placed.push([p.x, p.z, halfLen(v.def), v.def.radius, !!v.def.inf]);
+    }
+    const used = new Map(), cells = [];   // Zellen spiralförmig nach Abstand; abgelehnte bleiben für kleinere Einheiten
+    let ring = 0;
+    const nextCell = (u) => {
+      const inf = !!u.def.inf, hl = halfLen(u.def), hw = u.def.radius;
+      for (let i = 0; ; i++) {
+        if (i >= cells.length) {
           if (ring > 20) return [tcx, tcz];
+          const rc = [];
+          for (let dz = -ring; dz <= ring; dz++) for (let dx = -ring; dx <= ring; dx++) if (Math.max(Math.abs(dx), Math.abs(dz)) === ring && ok(tcx + dx, tcz + dz)) rc.push([tcx + dx, tcz + dz]);
+          rc.sort((a, b) => ((a[0] - tcx) ** 2 + (a[1] - tcz) ** 2) - ((b[0] - tcx) ** 2 + (b[1] - tcz) ** 2));
+          cells.push(...rc); ring++; i--; continue;
         }
-        const c = cand.shift();
-        if (!ok(c[0], c[1])) continue;
-        const k = c[1] * MAPN + c[0], n = used.get(k) || 0;
-        if (n >= (inf ? 3 : 1)) continue;
-        if (inf) { used.set(k, n + 1); if (n + 1 < 3) cand.unshift(c); }
-        else { // Fahrzeuge belegen 3x3 Zellen -> ~8 m Abstand
-          for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) { const kk = (c[1] + dz) * MAPN + c[0] + dx; used.set(kk, Math.max(used.get(kk) || 0, dx || dz ? 2 : 3)); }
-        }
+        const c = cells[i], k = c[1] * MAPN + c[0], n = used.get(k) || 0;
+        if (n >= (inf ? 3 : 1) || !fits(c[0], c[1], hl, hw, inf)) continue;
+        used.set(k, inf ? n + 1 : 3);
         return c;
       }
     };
     for (const u of ground) {
-      const c = nextCell(u.def.inf);
-      const gx = (c[0] + 0.5) * CELL + (u.def.inf ? (Math.random() - 0.5) * 2.4 : 0), gz = (c[1] + 0.5) * CELL + (u.def.inf ? (Math.random() - 0.5) * 2.4 : 0);
+      const c = nextCell(u);
+      const gx = (c[0] + 0.5) * CELL + (u.def.inf ? (rand() - 0.5) * 2.4 : 0), gz = (c[1] + 0.5) * CELL + (u.def.inf ? (rand() - 0.5) * 2.4 : 0);
       u.order = { type: attackMove ? 'attackMove' : 'move', x: gx, z: gz };
       u.target = null;
       if (u.def.cargo) u.hState = 'manual';
@@ -380,7 +475,7 @@ export class Game {
       const gx = x + Math.cos(a) * r, gz = z + Math.sin(a) * r;
       u.order = { type: attackMove ? 'attackMove' : 'move', x: gx, z: gz }; u.target = null; u.path = [{ x: gx, z: gz }];
     });
-    if (!quiet && units.some((u) => u.owner === 0)) play('order');
+    if (!quiet && !this.net && units.some((u) => this.mine(u))) play('order');
   }
   pathTo(u, x, z) {
     if (u.def.air) { u.path = [{ x, z }]; return; }
@@ -404,7 +499,7 @@ export class Game {
       u.order = { type: 'attack', target: target.id }; u.target = target; u.path = []; u.repath = 0;
       if (u.def.cargo) u.hState = 'manual';
     }
-    if (units.some((u) => u.owner === 0)) play('order');
+    if (!this.net && units.some((u) => this.mine(u))) play('order');
   }
   cmdStop(units) { for (const u of units) { u.order = null; u.path = []; u.target = null; u.guard = { x: u.x, z: u.z }; } }
   cmdHarvest(units, x, z) {
@@ -415,10 +510,10 @@ export class Game {
     if (u.type !== 'mcv') return false;
     const cx = Math.round(u.x / CELL - 2), cz = Math.round(u.z / CELL - 2);
     const p = this.players[u.owner];
-    if (!this.canPlace(p, 'hq', cx, cz, { ignore: u, adjacency: false })) { if (p.human) { play('deny'); say('Hier nicht möglich', 3); } return false; }
+    if (!this.canPlace(p, 'hq', cx, cz, { ignore: u, adjacency: false })) { if (p === this.human) { play('deny'); say('Hier nicht möglich', 3); } return false; }
     this.removeUnit(u);
     this.placeBuilding('hq', u.owner, cx, cz);
-    if (p.human) say('Basis wird errichtet');
+    if (p === this.human) say('Basis wird errichtet');
     return true;
   }
   sell(b) {
@@ -427,7 +522,52 @@ export class Game {
     p.credits += b.def.cost * 0.5 * (b.hp / b.maxHp);
     b.selling = 1;
     play('cash', b.x, b.z);
-    if (p.human) say('Gebäude verkauft', 2);
+    if (p === this.human) say('Gebäude verkauft', 2);
+  }
+
+  // ================================================================= Befehle der Spieler (Lockstep)
+  /** Führt einen Spielerbefehl aus. Allein sofort, im Mehrspieler auf allen Rechnern im selben Takt (net.js).
+   *  Befehle tragen nur ids/Zellen/Koordinaten; alles wird hier gegen den Besitzer pid geprüft. */
+  exec(pid, c) {
+    const p = this.players[pid];
+    if (!p || !p.alive || !c || typeof c.op !== 'string') return false;
+    const own = (id) => { const o = this.byId.get(id); return o && o.owner === pid && !o.dead && o.dying === undefined ? o : null; };
+    const units = () => (Array.isArray(c.ids) ? c.ids.slice(0, 400) : []).map(own).filter((o) => o && o.kind === 'unit');
+    const num = (v) => (Number.isFinite(v) ? v : 0);
+    const T = (t) => (UNITS[t] || BUILDINGS[t] ? t : null);
+    switch (c.op) {
+      case 'move': { const u = units(); if (u.length) this.cmdMove(u, num(c.x), num(c.z), !!c.am); return true; }
+      case 'attack': {
+        const t = this.byId.get(c.t), u = units();
+        if (!t || t.dead || this.allied(t.owner, pid) || !u.length) return false;
+        this.cmdAttack(u, t); return true;
+      }
+      case 'stop': this.cmdStop(units()); return true;
+      case 'harvest': { const u = units(); if (u.length) this.cmdHarvest(u, num(c.x), num(c.z)); return true; }
+      case 'dock': { for (const u of units()) if (u.def.cargo) { u.hState = 'toDock'; u.order = null; u.path = []; } return true; }
+      case 'deploy': { const u = own(c.id); return u ? this.cmdDeploy(u) : false; }
+      case 'queue': { const t = T(c.type); if (!t) return false; let ok = false; for (let i = 0; i < clamp(c.n | 0, 1, 5); i++) ok = this.queueItem(p, t) || ok; return ok; }
+      case 'cancel': { const t = T(c.type); if (t) this.cancelItem(p, t); return true; }
+      case 'hold': { const q = p.queues[c.key]; if (q && q.type) q.paused = !q.paused; return true; }
+      case 'place': { const t = T(c.type); return t && BUILDINGS[t] ? this.placeReady(p, t, c.cx | 0, c.cz | 0) : false; }
+      case 'wall': return this.placeWall(p, c.cx | 0, c.cz | 0, c.rot ? 1 : 0);
+      case 'sell': { const b = own(c.id); if (b && b.kind === 'building') this.sell(b); return true; }
+      case 'repair': { const b = own(c.id); if (b && b.kind === 'building' && (b.hp < b.maxHp || b.repairing)) b.repairing = !b.repairing; return true; }
+      case 'rally': { const b = own(c.id); if (b && b.kind === 'building') b.rally = { x: num(c.x), z: num(c.z) }; return true; }
+      case 'nuke': { const s = this.readySilo(p); return s ? this.launchNuke(s, num(c.x), num(c.z)) : false; }
+    }
+    return false;
+  }
+
+  /** Prüfsumme des Spielzustands (Mehrspieler: alle Rechner müssen gleich rechnen – sonst Meldung „asynchron“) */
+  checksum() {
+    let h = 2166136261 >>> 0;
+    const mix = (v) => { h = Math.imul(h ^ (v | 0), 16777619) >>> 0; };
+    for (const u of this.units) { mix(u.id); mix(Math.round(u.x * 64)); mix(Math.round(u.z * 64)); mix(Math.round(u.hp * 16)); }
+    for (const b of this.buildings) { mix(b.id); mix(Math.round(b.hp * 16)); }
+    for (const p of this.players) mix(Math.round(p.credits));
+    mix(this.projectiles.length);
+    return h;
   }
 
   canHit(u, t) {
@@ -440,7 +580,7 @@ export class Game {
 
   // ================================================================= Simulation
   update(dt) {
-    if (this.over) dt *= 0.3;
+    if (this.over && !this.net) dt *= 0.3;   // Zeitlupe nach dem Ende nur allein (Mehrspieler: alle Rechner müssen gleich weiterrechnen)
     this.time += dt;
     this.rebuildHash();
     for (const p of this.players) if (p.alive) this.tickProduction(p, dt);
@@ -478,13 +618,23 @@ export class Game {
     for (const u of this.units) this.placeUnitObj(u, dt);
   }
 
+  /** Sicht je Team (Simulation, für Teams mit Menschen) und daraus der Kriegsnebel dieses Rechners (Team des lokalen Spielers) */
   updateFogOfWar() {
-    const src = [];
-    for (const u of this.units) if (u.owner === 0 && !u.dead) src.push({ x: u.x, z: u.z, r: u.def.sight });
-    for (const b of this.buildings) if (b.owner === 0 && !b.dead) src.push({ x: b.x, z: b.z, r: b.def.sight });
-    updateFog(src);
-    for (const u of this.units) u.vis = u.owner === 0 || isVisible(u.x, u.z);
-    for (const b of this.buildings) { if (!b.seen && isVisible(b.x, b.z)) b.seen = true; b.obj.visible = b.owner === 0 || b.seen || !FOG.enabled; }
+    const src = new Map();
+    for (const u of this.units) if (!u.dead) { const a = this.players[u.owner].ally; if (!src.has(a)) src.set(a, []); src.get(a).push({ x: u.x, z: u.z, r: u.def.sight }); }
+    for (const b of this.buildings) if (!b.dead) { const a = this.players[b.owner].ally; if (!src.has(a)) src.set(a, []); src.get(a).push({ x: b.x, z: b.z, r: b.def.sight }); }
+    const myAlly = this.human.ally;
+    for (const p of this.players) {
+      if (!p === this.human && p.ally !== myAlly) continue;
+      if (this.allyVis.has(p.ally) && this.allyVis.get(p.ally).stamp === this.time) continue;
+      const g = this.allyVis.get(p.ally) || new Uint8Array(MAPN * MAPN);
+      visGrid(src.get(p.ally) || [], g);
+      g.stamp = this.time;
+      this.allyVis.set(p.ally, g);
+    }
+    updateFog(null, this.allyVis.get(myAlly));
+    for (const u of this.units) u.vis = this.friendly(u) || isVisible(u.x, u.z);
+    for (const b of this.buildings) { if (!b.seen && isVisible(b.x, b.z)) b.seen = true; b.obj.visible = this.friendly(b) || b.seen || !FOG.enabled; }
   }
 
   // ----------------------------------------------------------------- Einheiten
@@ -517,7 +667,7 @@ export class Game {
       u.acquireT -= dt;
       if (u.target && (u.target.dead || (u.target.owner === 0 && false))) u.target = null;
       if (u.acquireT <= 0) {
-        u.acquireT = 0.4 + Math.random() * 0.2;
+        u.acquireT = 0.4 + rand() * 0.2;
         const moving = o && o.type === 'move';
         if (!moving) {
           const r = o && o.type === 'attackMove' ? def.sight : (u.target ? def.range : def.sight);
@@ -543,7 +693,7 @@ export class Game {
       } else {
         u.repath -= dt;
         if (u.repath <= 0 || !u.path.length) {
-          u.repath = 1.5 + Math.random();
+          u.repath = 1.5 + rand();
           if (def.air) u.path = [{ x: t.x, z: t.z }];
           else this.pathTo(u, t.x, t.z);
         }
@@ -564,7 +714,7 @@ export class Game {
       const want = u.speed > 0.5 ? 'run' : 'idle';
       if (want !== u.anim) { u.nodes.actions[u.anim].fadeOut(0.2); u.nodes.actions[want].reset().fadeIn(0.2).play(); u.anim = want; }
       // Waffenhaltung: getragen bzw. im Anschlag, sobald gefeuert wird (Arme greifen per IK an die Waffe)
-      if (u.nodes.pose && u.vis) { u.aimK = (u.aimK || 0) + ((firing ? 1 : 0) - (u.aimK || 0)) * Math.min(1, dt * 9); u.nodes.pose(u.aimK); }
+      if (u.nodes.pose) { u.aimK = (u.aimK || 0) + ((firing ? 1 : 0) - (u.aimK || 0)) * Math.min(1, dt * 9); u.nodes.pose(u.aimK); }
     }
     if (u.nodes.rotor) u.nodes.rotor.rotation.y += dt * 28;
     if (u.nodes.dish) u.nodes.dish.rotation.y += dt * 3.2;
@@ -772,14 +922,14 @@ export class Game {
   findTarget(u, r) {
     let best = null, bd = 1e9;
     for (const e of this.unitsNear(u.x, u.z, r + 4)) {
-      if (e.owner === u.owner || e.dead || e.dying !== undefined || !this.canHit(u, e)) continue;
-      if (u.owner === 0 && !e.vis) continue;
+      if (this.allied(e.owner, u.owner) || e.dead || e.dying !== undefined || !this.canHit(u, e)) continue;
+      if (this.players[u.owner].human && !this.seenBy(u.owner, e.x, e.z)) continue;   // Menschen: nur Gesehenes (Sicht des Teams, deterministisch)
       const d = dist2(u.x, u.z, e.x, e.z) - (e.def.weapon ? 400 : 0);
       if (d < bd) { bd = d; best = e; }
     }
     if (best) return best;
     for (const b of this.buildings) {
-      if (b.owner === u.owner || b.dead || b.selling) continue;
+      if (this.allied(b.owner, u.owner) || b.dead || b.selling) continue;
       if (!this.canHit(u, b)) continue;
       const d = this.edgeDist(u.x, u.z, b) * (b.def.wall ? 2.5 : 1);
       if (d <= r * (b.def.wall ? 2.5 : 1) && d * d < bd) { bd = d * d; best = b; }
@@ -833,7 +983,7 @@ export class Game {
         u.stuck++;
         if (last && d < 7) { u.path = []; u.stuck = 0; return; }
         if (u.stuck > 3) { u.path = []; u.stuck = 0; return; }
-        if (!def.air) { const g = u.path[u.path.length - 1]; this.pathTo(u, g.x, g.z); return; }
+        if (!def.air) { const g = u.path[u.path.length - 1], st = u.stuck; this.pathTo(u, g.x, g.z); u.stuck = st; u.lastD = d; return; }   // Zähler behalten: sonst ewiges Neuplanen
       } else u.stuck = 0;
       u.lastD = d; u.progT = 0;
     }
@@ -860,22 +1010,28 @@ export class Game {
   avoid(u, want, goalD = 1e9) {
     const def = u.def;
     const fx = Math.cos(want), fz = Math.sin(want);
+    const au = segA(def);
     const look = def.radius * 1.6 + u.speed * 0.9 + (def.inf ? 1 : 3);
     let steer = 0, slow = 1, wait = false;
-    for (const v of this.unitsNear(u.x, u.z, look + 5, _nearA)) {
+    for (const v of this.unitsNear(u.x, u.z, look + au + MAX_REACH + 2, _nearA)) {
       if (v === u || v.dying !== undefined || v.def.air) continue;
       if (def.inf && v.def.inf) continue;             // Infanterie untereinander: weiche Trennung genügt
       const rx = v.x - u.x, rz = v.z - u.z;
       const ahead = rx * fx + rz * fz;
       if (ahead <= 0 || ahead > goalD + 1) continue;   // hinter dem eigenen Ziel: egal
-      const rr = (def.radius + v.def.radius) * (def.inf || v.def.inf ? 0.75 : 1.0);
+      // Ausdehnung beider Kapseln quer und längs zur Fahrtrichtung (lange Fahrzeuge: Bug an Heck mit Luft)
+      const av = segA(v.def), hx = Math.cos(v.heading), hz = Math.sin(v.heading);
+      const k = def.inf || v.def.inf ? 0.75 : 1.0;
+      const rr = (def.radius + v.def.radius + av * Math.abs(hz * fx - hx * fz)) * k;
+      const rl = (def.radius + v.def.radius + au + av * Math.abs(hx * fx + hz * fz)) * k + (def.inf || v.def.inf ? 0 : SEP_GAP);
       const side = rz * fx - rx * fz;                  // > 0: v liegt auf der Seite steigender Winkel
       if (Math.abs(side) >= rr) continue;
       const moving = v.speed > 1;
       // stehende eigene Einheiten früh bitten, Platz zu machen
-      if (!moving && v.owner === u.owner && ahead < look * 1.8 + rr) this.makeWay(v, u, fx, fz, side);
-      if (ahead > look + rr) continue;
-      const gap = ahead - rr;
+      // (nicht, wenn u selbst nur ausweicht – sonst schicken sich zwei Einheiten gegenseitig hin und her)
+      if (!moving && !u.home && v.owner === u.owner && ahead < look * 1.8 + rl) this.makeWay(v, u, fx, fz, side);
+      if (ahead > look + rl) continue;
+      const gap = ahead - rl;
       if (moving && Math.cos(v.heading) * fx + Math.sin(v.heading) * fz > 0.6) {   // fährt in dieselbe Richtung: Abstand halten
         if (gap < 2) { slow = Math.min(slow, clamp(v.speed / def.speed + gap / 2 * 0.5, 0.25, 1)); wait = gap < 1; }
         continue;
@@ -895,10 +1051,10 @@ export class Game {
   }
 
   /** Stehende Einheit v räumt den Weg für u: ein Schritt quer zur Fahrtrichtung von u. */
-  makeWay(v, u, fx, fz, side) {
+  makeWay(v, u, fx, fz, side, noHome = false) {
     if (!v.def.speed || v.def.cargo || v.order || v.path.length || v.target || (v.yieldT || 0) > this.time) return;
     v.yieldT = this.time + 1.0;
-    const step = u.def.radius + v.def.radius + 1.2;
+    const step = u.def.radius + v.def.radius + segA(v.def) * Math.abs(Math.sin(v.heading) * fx - Math.cos(v.heading) * fz) + 1.2;
     const s0 = side >= 0 ? 1 : -1;
     for (const sg of [s0, -s0]) {
       const x = v.x - fz * sg * step, z = v.z + fx * sg * step;
@@ -907,10 +1063,10 @@ export class Game {
       let free = true;
       for (const o of this.unitsNear(x, z, v.def.radius + 4, _nearB)) {
         if (o === v || o === u || o.def.air || o.speed > 0.5) continue;
-        if (dist(o.x, o.z, x, z) < (o.def.radius + v.def.radius) * 0.8) { free = false; break; }
+        if (dist(o.x, o.z, x, z) < o.def.radius + v.def.radius) { free = false; break; }
       }
       if (!free) continue;
-      if (!v.home) v.home = { x: v.x, z: v.z };     // alter Standplatz: dorthin geht es später zurück
+      if (!v.home && !noHome) v.home = { x: v.x, z: v.z };     // alter Standplatz: dorthin geht es später zurück (nicht bei Fabrikausgang)
       v.path = [{ x, z }]; v.guard = { x, z }; v.stuck = 0; v.lastD = 1e9; v.progT = 0;
       return;
     }
@@ -924,24 +1080,66 @@ export class Game {
     return !this.terrain.isPassable(Math.floor(u.x / CELL), Math.floor(u.z / CELL)) && (Math.floor(u.x / CELL) === cx && Math.floor(u.z / CELL) === cz || this.terrain.passable[cz * MAPN + cx] === 1);
   }
 
+  /** Überlappungen auflösen (jeder Schritt, feste Reihenfolge: this.units, Partner aus dem Raster mit größerer id).
+   *  Bodeneinheiten als Kapseln (Fahrzeuge mit SEP_GAP Luft, Infanterie untereinander enger), Korrektur beidseitig nach
+   *  Gewicht (stehende Einheiten und schwere Fahrzeuge weichen weniger), nie in unpassierbare Zellen. */
   separate(dt) {
-    const near = [];
+    const maxStep = 15 * dt;
     for (const u of this.units) {
       if (u.dead || u.dying !== undefined) continue;
-      const air = !!u.def.air;
-      for (const v of this.unitsNear(u.x, u.z, u.def.radius + 4, near)) {
-        if (v.id <= u.id || v.dying !== undefined || !!v.def.air !== air) continue;
-        const rr = (u.def.radius + v.def.radius) * (air ? 1.6 : u.def.inf || v.def.inf ? 0.85 : 1.05);
-        let dx = v.x - u.x, dz = v.z - u.z; let d = Math.hypot(dx, dz);
-        if (d >= rr) continue;
-        if (d < 0.01) { dx = Math.random() - 0.5; dz = Math.random() - 0.5; d = Math.hypot(dx, dz); }
-        const push = Math.min((rr - d) * 0.5, 6 * dt * (air ? 1 : 2));
-        const mu = u.def.inf && !v.def.inf ? 1.6 : (!u.def.inf && v.def.inf ? 0.3 : 1), mv = 2 - mu;
-        const ux = u.x - dx / d * push * mu, uz = u.z - dz / d * push * mu;
-        const vx = v.x + dx / d * push * mv, vz = v.z + dz / d * push * mv;
-        if (air || this.walkable(u, ux, uz)) { u.x = ux; u.z = uz; }
-        if (air || this.walkable(v, vx, vz)) { v.x = vx; v.z = vz; }
+      if (u.def.air) { this.separateAir(u, dt); continue; }
+      const du = u.def, ru = reachOf(du);
+      let segU = false;
+      for (const v of this.unitsNear(u.x, u.z, ru + MAX_REACH + SEP_GAP, _nearC)) {
+        if (v.id <= u.id || v.dying !== undefined || v.def.air) continue;
+        const dv = v.def;
+        const need = du.inf && dv.inf ? (du.radius + dv.radius) * 0.85 : du.radius + dv.radius + (du.inf || dv.inf ? 0 : SEP_GAP);
+        const far = need + ru - du.radius + reachOf(dv) - dv.radius;      // Mittelpunkte weiter auseinander: sicher frei
+        if (dist2(u.x, u.z, v.x, v.z) >= far * far) continue;
+        if (!segU) { bodySeg(u, _sA); segU = true; }
+        const c = closestSeg(_sA, bodySeg(v, _sB), _cp);
+        let nx = c[2] - c[0], nz = c[3] - c[1], d = Math.hypot(nx, nz);
+        const pen = need - d;
+        if (pen <= SEP_SLOP) continue;
+        if (d < 1e-3) { // Körperachsen kreuzen sich: von Mitte zu Mitte trennen
+          nx = v.x - u.x; nz = v.z - u.z; d = Math.hypot(nx, nz);
+          if (d < 1e-3) { nx = rand() - 0.5; nz = rand() - 0.5; d = Math.hypot(nx, nz); }
+        }
+        nx /= d; nz /= d;
+        this.arriveNear(u, v); this.arriveNear(v, u);
+        const hu = heft(u), hv = heft(v);
+        const k = Math.min(pen * 0.6, maxStep), ku = k * hv / (hu + hv), kv = k - ku;
+        const mu = this.nudge(u, -nx * ku, -nz * ku), mv = this.nudge(v, nx * kv, nz * kv);
+        if (!mu && mv) this.nudge(v, nx * ku, nz * ku);        // eine Seite steht an Wand/Wasser: die andere weicht ganz
+        else if (mu && !mv) this.nudge(u, -nx * kv, -nz * kv);
+        segU = false;
       }
+    }
+  }
+  /** Einheit um (dx, dz) verschieben, wenn begehbar (sonst nur längs einer Achse); true = bewegt */
+  nudge(u, dx, dz) {
+    const x = clamp(u.x + dx, 1, WORLD - 1), z = clamp(u.z + dz, 1, WORLD - 1);
+    if (this.walkable(u, x, z)) { u.x = x; u.z = z; return true; }
+    if (Math.abs(dx) > 1e-4 && this.walkable(u, x, u.z)) { u.x = x; return true; }
+    if (Math.abs(dz) > 1e-4 && this.walkable(u, u.x, z)) { u.z = z; return true; }
+    return false;
+  }
+  /** Ankunft: steht am Zielpunkt von u schon die stehende Einheit v, hält u hier an statt zu drängeln */
+  arriveNear(u, v) {
+    const o = u.order;
+    if (!o || (o.type !== 'move' && o.type !== 'attackMove') || u.path.length !== 1 || v.path.length || v.speed > 0.5) return;
+    const g = u.path[0], rr = reachOf(u.def) + reachOf(v.def);
+    if (dist(g.x, g.z, v.x, v.z) < rr && dist(g.x, g.z, u.x, u.z) < rr + 2) u.path = [];
+  }
+  separateAir(u, dt) {
+    for (const v of this.unitsNear(u.x, u.z, u.def.radius + 4, _nearC)) {
+      if (v.id <= u.id || v.dying !== undefined || !v.def.air) continue;
+      const rr = (u.def.radius + v.def.radius) * 1.6;
+      let dx = v.x - u.x, dz = v.z - u.z; let d = Math.hypot(dx, dz);
+      if (d >= rr) continue;
+      if (d < 0.01) { dx = rand() - 0.5; dz = rand() - 0.5; d = Math.hypot(dx, dz); }
+      const push = Math.min((rr - d) * 0.5, 6 * dt);
+      u.x -= dx / d * push; u.z -= dz / d * push; v.x += dx / d * push; v.z += dz / d * push;
     }
   }
 
@@ -1028,7 +1226,7 @@ export class Game {
       case 'toOre': {
         if (u.path.length) return;
         const k = Math.floor(u.z / CELL) * MAPN + Math.floor(u.x / CELL);
-        if (T.ore[k] > 5 && u.oreCell === k) { u.hState = 'harvest'; return; }
+        if (T.ore[k] > 5) { u.oreCell = k; u.hState = 'harvest'; return; }   // auch wenn ein Nachbar ihn vom Zielfeld geschoben hat
         const pref = u.prefOre || { x: u.x, z: u.z };
         const c = this.findOre(pref.x, pref.z, u);
         u.prefOre = null;
@@ -1082,7 +1280,7 @@ export class Game {
         u.cargo -= amt;
         const inc = amt * (p.diff ? p.diff.income : 1);
         p.credits += inc; p.stats.ore += inc;
-        if (p.human && Math.random() < dt * 4) play('cash', u.x, u.z);
+        if (p === this.human && Math.random() < dt * 4) play('cash', u.x, u.z);
         if (u.cargo <= 0.5) { u.cargo = 0; r.dockUser = 0; u.hState = 'toOre'; this.pathTo(u, u.x + 9, u.z); }
         return;
       }
@@ -1115,7 +1313,11 @@ export class Game {
       let d = dist2(x, z, cx, cz);
       if (d > mr2) continue;
       // andere Sammler meiden
-      for (const o of this.units) if (o !== u && o.def.cargo && o.oreCell === k && !o.dead) d += 900;
+      for (const o of this.units) {   // auch Nachbarfelder: Sammler sind fast 10 m lang
+        if (o === u || !o.def.cargo || o.dead) continue;
+        if (o.oreCell === k) d += 900;
+        else if (dist2(o.x, o.z, cx, cz) < 64) d += 600;
+      }
       // gefährliche Gebiete meiden (KI-Gebäude nahe)
       if (d < bd) { bd = d; best = k; }
     }
@@ -1155,7 +1357,7 @@ export class Game {
       if (sk > 0 && b.obj.visible && Math.random() < dt * 12) fx.dust(b.x + (Math.random() - 0.5) * b.w * CELL, b.y, b.z + (Math.random() - 0.5) * b.h * CELL, 1.6);
       if (b.selling > 2.2) {
         const n = Math.floor(b.def.cost / 700);
-        for (let i = 0; i < n; i++) this.spawnUnit('rifle', b.owner, b.x + (Math.random() - 0.5) * 4, b.z + b.h * CELL / 2 + 2);
+        for (let i = 0; i < n; i++) this.spawnUnit('rifle', b.owner, b.x + (rand() - 0.5) * 4, b.z + b.h * CELL / 2 + 2);
         this.removeBuilding(b, false);
       }
       return;
@@ -1229,7 +1431,7 @@ export class Game {
     if (b.launching || !R) return;
     if (b.charge < 1) {
       b.charge = Math.min(1, b.charge + dt / NUKE.charge * (p.low ? 0 : 1));
-      if (b.charge >= 1 && p.human) { say('Atomrakete bereit', 1); play('ready'); this.events.push({ type: 'msg', text: 'Atomrakete bereit – Ziel wählen (Taste N)' }); }
+      if (b.charge >= 1 && p === this.human) { say('Atomrakete bereit', 1); play('ready'); this.events.push({ type: 'msg', text: 'Atomrakete bereit – Ziel wählen (Taste N)' }); }
     }
     const k = clamp((b.charge - 0.66) / 0.34, 0, 1);
     R.visible = k > 0;
@@ -1247,7 +1449,8 @@ export class Game {
     const missile = R.clone(true);   // fallende Rakete (Kopie, die Basis kann inzwischen zerstört sein)
     p.stats.nukes = (p.stats.nukes || 0) + 1;
     (this.nukeMarks ??= []).push({ x, z, owner: b.owner, until: this.time + NUKE.flight + 2.2 });   // Zielkreis im Overlay bis zum Einschlag
-    if (p.human) say('Atomrakete gestartet', 1);
+    if (p === this.human) say('Atomrakete gestartet', 1);
+    else if (this.allied(p.id, this.me)) { say('Verbündete Atomrakete gestartet', 1); this.events.push({ type: 'nuke', x, z, text: 'Verbündeter ' + this.playerName(p) + ' hat eine Atomrakete gestartet.' }); }
     else if (this.human.alive) { say('Warnung: Atomraketenstart erkannt', 1); this.events.push({ type: 'nuke', x, z, text: 'Warnung: feindliche Atomrakete gestartet!' }); }
     if (b.obj.visible) play('rocket', b.x, b.z);
     let t = 0;
@@ -1364,7 +1567,7 @@ export class Game {
         b.target = null;
         let bd = 1e9;
         for (const e of this.unitsNear(b.x, b.z, def.range)) {
-          if (e.owner === b.owner || e.dying !== undefined || !this.canHit(b, e)) continue;
+          if (this.allied(e.owner, b.owner) || e.dying !== undefined || !this.canHit(b, e)) continue;
           const d = dist2(b.x, b.z, e.x, e.z) * (e.def.air && WEAPONS[def.weapon].aaPref ? 0.25 : 1);
           if (d < bd) { bd = d; b.target = e; }
         }
@@ -1379,7 +1582,7 @@ export class Game {
     if (b.nodes.turret) b.nodes.turret.rotation.y = -b.turretYaw - Math.PI / 2;   // Gebäudemodelle zeigen nach Norden (-Z)
     if (b.salvo > 0) return;
     if (Math.abs(angDiff(b.turretYaw, want)) < 0.06 && b.cooldown <= 0 && !p.low) this.fire(b, t);
-    else if (Math.abs(angDiff(b.turretYaw, want)) < 0.06 && b.cooldown <= 0 && p.low && Math.random() < 0.5) this.fire(b, t);
+    else if (Math.abs(angDiff(b.turretYaw, want)) < 0.06 && b.cooldown <= 0 && p.low && rand() < 0.5) this.fire(b, t);
   }
 
   // ----------------------------------------------------------------- Waffen
@@ -1396,7 +1599,7 @@ export class Game {
 
   fire(s, t) {
     const w = WEAPONS[s.def.weapon];
-    s.cooldown = w.rof * (0.9 + Math.random() * 0.2) * RANK.rof[s.rank || 0];
+    s.cooldown = w.rof * (0.9 + rand() * 0.2) * RANK.rof[s.rank || 0];
     if (w.salvo) { s.salvo = w.salvo; s.salvoT = 0; s.salvoTarget = t; return; }
     this.launch(s, t);
     if (w.burst) { for (let i = 1; i < w.burst; i++) this.after(i * 0.09, () => { if (!s.dead && !t.dead) this.launch(s, t); }); }
@@ -1405,11 +1608,11 @@ export class Game {
   launch(s, t) {
     const w = WEAPONS[s.def.weapon];
     const m = this.muzzlePos(s, new THREE.Vector3());
-    const tx = t.x + (t.kind === 'building' ? (Math.random() - 0.5) * t.w * CELL * 0.5 : 0);
-    const tz = t.z + (t.kind === 'building' ? (Math.random() - 0.5) * t.h * CELL * 0.5 : 0);
+    const tx = t.x + (t.kind === 'building' ? (rand() - 0.5) * t.w * CELL * 0.5 : 0);
+    const tz = t.z + (t.kind === 'building' ? (rand() - 0.5) * t.h * CELL * 0.5 : 0);
     const ty = t.kind === 'building' ? t.y + 2.5 : (t.y + (t.def.air ? 1.5 : t.def.inf ? 1.4 : 1.3));
     const dx = tx - m.x, dz = tz - m.z, dl = Math.hypot(dx, dz) || 1;
-    const vis = s.vis !== false && (s.owner === 0 || isVisible(s.x, s.z) || isVisible(tx, tz));
+    const vis = s.vis !== false && (this.friendly(s) || isVisible(s.x, s.z) || isVisible(tx, tz));
     const ux = dx / dl, uz = dz / dl;
     const big = w.proj === 'shell' || w.shellArc;
     if (big) { s.recoil = 1; s.recoilAmt = w.shellArc ? 0.8 : 0.55; s.rock = 1; s.rockA = Math.atan2(uz, ux); }
@@ -1455,7 +1658,7 @@ export class Game {
       P.rocket = true; P.vx = dx / dl; P.vy = 0.15; P.vz = dz / dl; P.speed = w.speed;
     } else if (w.proj === 'arc') {
       const inacc = w.inaccuracy || 0;
-      P.tx += (Math.random() - 0.5) * inacc * 2; P.tz += (Math.random() - 0.5) * inacc * 2; P.ty = this.terrain.heightAt(P.tx, P.tz);
+      P.tx += (rand() - 0.5) * inacc * 2; P.tz += (rand() - 0.5) * inacc * 2; P.ty = this.terrain.heightAt(P.tx, P.tz);
       P.rocket = !w.shellArc; P.arc = true; P.T = Math.max(1.2, dl / w.speed); P.apex = 6 + dl * 0.3; P.vx = dx; P.vy = 1; P.vz = dz;
     }
     this.projectiles.push(P);
@@ -1549,7 +1752,7 @@ export class Game {
         if (!w.energy) play('explosion', P.tx, P.tz);
       }
       for (const e of this.unitsNear(P.tx, P.tz, w.splash + 3)) {
-        if (e.owner === P.owner || e.dying !== undefined) continue;
+        if (this.allied(e.owner, P.owner) || e.dying !== undefined) continue;
         if (e.def.air && !w.aa) continue;
         if (e.def.air && e !== t) continue;
         const d = e === t && !P.arc ? 0 : dist(e.x, e.z, P.tx, P.tz);
@@ -1557,7 +1760,7 @@ export class Game {
         this.damage(e, w.dmg * (1 - 0.6 * d / (w.splash + 1)) * w.vs[e.def.armor], P.src);
       }
       const b = this.buildingAtCell(Math.floor(P.tx / CELL), Math.floor(P.tz / CELL));
-      if (b && b.owner !== P.owner) this.damage(b, w.dmg * w.vs.building, P.src);
+      if (b && !this.allied(b.owner, P.owner)) this.damage(b, w.dmg * w.vs.building, P.src);
       else if (t && t.kind === 'building' && !t.dead && t !== b && !P.arc) this.damage(t, w.dmg * w.vs.building, P.src);
     } else if (t && !t.dead) {
       const armor = t.kind === 'building' ? 'building' : t.def.armor;
@@ -1581,15 +1784,15 @@ export class Game {
     if (e.rank) amt *= RANK.armor[e.rank];
     e.hp -= amt; e.lastHit = this.time; e.attacker = src;
     const p = this.players[e.owner];
-    if (e.kind === 'building' && p.human) { say('Unsere Basis wird angegriffen', 25); this.events.push({ type: 'attack', x: e.x, z: e.z, t: this.time }); }
-    else if (e.kind === 'unit' && p.human && !e.def.cargo) say('Einheiten unter Beschuss', 30);
-    if (e.kind === 'unit' && e.def.cargo && p.human) say('Erzsammler wird angegriffen', 20);
+    if (e.kind === 'building' && p === this.human) { say('Unsere Basis wird angegriffen', 25); this.events.push({ type: 'attack', x: e.x, z: e.z, t: this.time }); }
+    else if (e.kind === 'unit' && p === this.human && !e.def.cargo) say('Einheiten unter Beschuss', 30);
+    if (e.kind === 'unit' && e.def.cargo && p === this.human) say('Erzsammler wird angegriffen', 20);
     // Vergeltung
     if (e.kind === 'unit' && src && !src.dead && !e.order && !e.target && e.def.weapon && this.canHit(e, src)) e.target = src;
     if (e.hp <= 0) {
       e.hp = 0;
       if (src && this.players[src.owner]) this.players[src.owner].stats.kills++;
-      if (src && src.kind === 'unit' && !src.dead && src.owner !== e.owner) this.gainXp(src, e.def.cost || 100);
+      if (src && src.kind === 'unit' && !src.dead && !this.allied(src.owner, e.owner)) this.gainXp(src, e.def.cost || 100);
       if (e.kind === 'unit') this.killUnit(e); else this.destroyBuilding(e);
     }
   }
@@ -1601,7 +1804,7 @@ export class Game {
     if (r > (u.rank || 0)) {
       u.rank = r;
       if (u.vis) { for (let i = 0; i < 14; i++) this.fx.fire.emit({ x: u.x, y: u.y + 2, z: u.z, vx: (Math.random() - 0.5) * 3, vy: 3 + Math.random() * 3, vz: (Math.random() - 0.5) * 3, life: 0.7, s0: 0.6, s1: 0.1, c0: [1, 0.85, 0.3], a0: 1, a1: 0, grav: -4 }); }
-      if (u.owner === 0) { say(r === 2 ? 'Elite-Einheit' : 'Einheit befördert', 4); play('ready'); }
+      if (this.mine(u)) { say(r === 2 ? 'Elite-Einheit' : 'Einheit befördert', 4); play('ready'); }
     }
   }
 
@@ -1686,7 +1889,7 @@ export class Game {
         if (t >= 5) { this.removeUnit(u); return false; }
       });
     }
-    if (p.human) say('Einheit verloren', 8);
+    if (p === this.human) say('Einheit verloren', 8);
   }
   removeUnit(u) {
     u.dead = true; u.removed = true;
@@ -1739,7 +1942,7 @@ export class Game {
       }
       if (t >= 14) return false;
     });
-    if (p.human) say('Gebäude zerstört', 4);
+    if (p === this.human) say('Gebäude zerstört', 4);
     this.removeBuilding(b, true);
   }
   removeBuilding(b, rubble) {
@@ -1763,16 +1966,22 @@ export class Game {
       const hasU = this.units.some((u) => u.owner === p.id && !u.dead && (u.def.weapon || u.type === 'mcv'));
       if (!hasB && !hasU) {
         p.alive = false;
-        if (!p.human) { say(TEAMS[p.team].name + ' wurde vernichtet', 1); this.events.push({ type: 'msg', text: TEAMS[p.team].name + ' wurde vernichtet.' }); }
+        if (p !== this.human) { const n = this.playerName(p); say(n + ' wurde vernichtet', 1); this.events.push({ type: 'msg', text: n + ' wurde vernichtet.' }); }
         // Restliche Einheiten zerstören
         for (const u of this.units) if (u.owner === p.id && !u.dead) this.killUnit(u);
       }
     }
+    // Ende: nur noch ein Team übrig (Teams: opts.slots[..].ally). over gilt für diesen Rechner: 'win' / 'lose'
+    const left = new Set(this.players.filter((p) => p.alive).map((p) => p.ally));
+    if (left.size <= 1 && !this.winner) this.winner = { ally: [...left][0] ?? -1, t: this.time };
     if (!this.over) {
-      if (!this.human.alive) { this.over = 'lose'; say('Mission gescheitert', 1); }
-      else if (this.players.every((p) => p.human || !p.alive)) { this.over = 'win'; say('Sieg. Mission erfüllt', 1); }
+      const mineAlive = this.players.some((p) => p.ally === this.human.ally && p.alive);
+      if (!mineAlive) { this.over = 'lose'; say('Mission gescheitert', 1); }
+      else if (left.size === 1) { this.over = 'win'; say('Sieg. Mission erfüllt', 1); }
     }
   }
+  /** Anzeigename eines Spielers: Spielername (Mehrspieler) bzw. Verband */
+  playerName(p) { return p.name ? `${p.name} (${TEAMS[p.team].name})` : TEAMS[p.team].name; }
 }
 
 function mkQ() { return { type: null, progress: 0, spent: 0, ready: false, paused: false, list: [] }; }

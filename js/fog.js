@@ -91,9 +91,8 @@ export function cellIndex(x, z) {
 export function isVisible(x, z) { if (!FOG.enabled) return true; const i = cellIndex(x, z); return i >= 0 && FOG.visible[i] === 1; }
 export function isExplored(x, z) { if (!FOG.enabled) return true; const i = cellIndex(x, z); return i >= 0 && FOG.explored[i] === 1; }
 
-/** Neu berechnen aus Sichtquellen [{x,z,r}] */
-export function updateFog(sources) {
-  const vis = FOG.visible, exp = FOG.explored;
+/** Sichtraster aus Sichtquellen [{x,z,r}]: vis[k] = 1 gesehen (exp optional: erkundet mitschreiben) */
+export function visGrid(sources, vis, exp = null) {
   vis.fill(0);
   for (const s of sources) {
     const r = s.r / CELL, cx = s.x / CELL, cz = s.z / CELL;
@@ -102,9 +101,17 @@ export function updateFog(sources) {
     const r2 = r * r;
     for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
       const dx = x + 0.5 - cx, dz = z + 0.5 - cz;
-      if (dx * dx + dz * dz <= r2) { vis[z * MAPN + x] = 1; exp[z * MAPN + x] = 1; }
+      if (dx * dx + dz * dz <= r2) { vis[z * MAPN + x] = 1; if (exp) exp[z * MAPN + x] = 1; }
     }
   }
+  return vis;
+}
+
+/** Neu berechnen aus Sichtquellen [{x,z,r}] (bzw. vorberechnetem Raster grid) */
+export function updateFog(sources, grid = null) {
+  const vis = FOG.visible, exp = FOG.explored;
+  if (grid) { vis.set(grid); for (let i = 0; i < vis.length; i++) if (vis[i]) exp[i] = 1; }
+  else visGrid(sources, vis, exp);
   const d = FOG.data;
   for (let i = 0; i < d.length; i++) {
     const target = !FOG.enabled ? 255 : vis[i] ? 255 : exp[i] ? 128 : 0;

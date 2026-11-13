@@ -33,7 +33,7 @@ if (!fs.existsSync(path.join(ROOT, 'index.html'))) fail(`Spieldateien nicht gefu
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json',
   '.glb': 'model/gltf-binary', '.gltf': 'model/gltf+json', '.bin': 'application/octet-stream', '.jpg': 'image/jpeg', '.png': 'image/png',
-  '.webp': 'image/webp', '.hdr': 'application/octet-stream', '.svg': 'image/svg+xml',
+  '.webp': 'image/webp', '.hdr': 'application/octet-stream', '.ico': 'image/x-icon', '.svg': 'image/svg+xml',
 };
 // Herzschlag: die Seite meldet sich alle 5 s und beim Schließen ab
 const HEART = `<script>(()=>{const p=()=>fetch('/__alive',{cache:'no-store'}).catch(()=>{});p();setInterval(p,5000);

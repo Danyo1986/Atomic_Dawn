@@ -321,9 +321,30 @@ export class Terrain {
             ${snow ? `rockC = mix(rockC, vec3(0.86, 0.89, 0.93), smoothstep(0.55, 0.9, normalize(vTN).y) * 0.75);
             dirtC = mix(dirtC, grassC * vec3(0.8, 0.78, 0.76), 0.5);
             grassC *= vec3(0.9, 0.93, 0.98);` : ''}
-            vec3 col = grassC * wBase + texture2D(tD1, tuv * 0.8).rgb * sw.x${snow ? ' * vec3(0.88, 0.92, 0.98)' : ''}
-                     + rockC * sw.y + texture2D(tD3, tuv * ${snow ? '2.2' : '1.4'}).rgb${snow ? ' * vec3(0.5, 0.52, 0.57)' : ''} * sw.z
-                     + min(dirtC, vec3(0.55)) * vec3(0.92, 0.84, 0.74) * sw.w;
+            vec3 c1 = texture2D(tD1, tuv * 0.8).rgb${snow ? ' * vec3(0.88, 0.92, 0.98)' : ''};
+            vec3 c3 = texture2D(tD3, tuv * ${snow ? '2.2' : '1.4'}).rgb${snow ? ' * vec3(0.5, 0.52, 0.57)' : ''};
+            vec3 c4 = min(dirtC, vec3(0.55)) * vec3(0.92, 0.84, 0.74);
+            // Höhenmischung: Gewichte mit der Texturhelligkeit verschieben (Gras auf den Erhebungen, Erde in den Rissen)
+            {
+              const vec3 LW = vec3(0.3, 0.55, 0.15);
+              float e0 = wBase + (dot(grassC, LW) - 0.5) * 0.9 * min(1.0, wBase * 4.0);
+              float e1 = sw.x + (dot(c1, LW) - 0.5) * 0.9 * min(1.0, sw.x * 4.0);
+              float e2 = sw.y + (dot(rockC, LW) - 0.5) * 0.9 * min(1.0, sw.y * 4.0);
+              float e3 = sw.z + (dot(c3, LW) - 0.5) * 0.9 * min(1.0, sw.z * 4.0);
+              float e4 = sw.w + (0.5 - dot(c4, LW) * 1.2) * 0.9 * min(1.0, sw.w * 4.0);
+              float ma = max(max(max(e0, e1), max(e2, e3)), e4);
+              vec4 b = max(vec4(e1, e2, e3, e4) - ma + 0.16, 0.0);
+              float b0 = max(e0 - ma + 0.16, 0.0);
+              float bs = b0 + b.x + b.y + b.z + b.w;
+              wBase = b0 / bs; sw = b / bs;
+            }
+            vec3 col = grassC * wBase + c1 * sw.x + rockC * sw.y + c3 * sw.z + c4 * sw.w;
+            // Makrofarbe: großflächige Tönung (40 m und 150 m) trocken/warm <-> satt grün (Winter: blau/weiß)
+            {
+              float mt = smoothstep(0.25, 0.75, texture2D(tD1, vTW.xz / 41.0 + 0.13).g * 0.5 + texture2D(tD0, vTW.xz / 151.0 + 0.57).g * 0.5);
+              vec3 tint = ${snow ? 'mix(vec3(1.02, 1.04, 1.06), vec3(0.9, 0.97, 1.1), mt)' : 'mix(vec3(1.16, 1.02, 0.74), vec3(0.8, 1.1, 0.78), mt)'};
+              col *= mix(vec3(1.0), tint, clamp(wBase + sw.x * 0.7 + sw.w * 0.3, 0.0, 1.0));
+            }
             ${this.city ? `{   // Stadt: gestrichelte Mittellinie auf den Straßen (Raster 48 m, Achse bei 18 m), nicht auf Kreuzungen
               vec2 sd = abs(mod(vTW.xz - 18.0 + 24.0, 48.0) - 24.0);
               float lane = 0.0;
@@ -333,6 +354,9 @@ export class Terrain {
               col = mix(col, vec3(0.8, 0.83, 0.87), max(lane * 0.6, edge) * sw.z);
             }` : ''}
             col *= 0.78 + macro * 0.55;
+            // Uferzone: nahe der Wasserlinie dunkler, feuchter, leicht sandig; weicher Auslauf nach oben
+            float wet = 1.0 - smoothstep(${WATER_LEVEL.toFixed(2)} + 0.1, ${WATER_LEVEL.toFixed(2)} + 1.6, vTW.y);
+            ${snow ? 'col *= mix(1.0, 0.82, wet);' : 'col = mix(col, vec3(dot(col, vec3(0.3, 0.55, 0.15))) * vec3(1.1, 0.98, 0.78), wet * 0.3) * mix(1.0, 0.7, wet);'}
             diffuseColor.rgb = col;
           `)
           .replace('#include <normal_fragment_maps>', `
@@ -342,7 +366,7 @@ export class Terrain {
             vec3 wn = normalize(normalize(vTN) * max(tn.z, 0.2) + vec3(tn.x, 0.0, -tn.y) * 1.2);
             normal = normalize((viewMatrix * vec4(wn, 0.0)).xyz);
           `)
-          .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = mix(0.97, 0.55, 1.0 - smoothstep(-1.6, -0.6, vTW.y));')
+          .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = mix(0.97, 0.55, 1.0 - smoothstep(-1.6, -0.6, vTW.y)) * (1.0 - 0.22 * wet);')
           .replace('#include <dithering_fragment>', FOG_FRAG_BODY + '\n#include <dithering_fragment>');
     };
     mat.customProgramCacheKey = () => 'terrain' + (snow ? 'Snow' : '') + (this.city ? 'City' : '');
